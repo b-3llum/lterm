@@ -1,0 +1,37 @@
+[package]
+name = "lterm"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight cross-platform terminal with splits, tabs, persistent sessions and inline images"
+license = "MIT"
+repository = "https://github.com/b-3llum/lterm"
+
+[workspace]
+members = ["mdterm"]
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+portable-pty = "0.9"
+vte = "0.15"
+fontdue = "0.9"
+png = "0.17"
+miniz_oxide = "0.8"
+base64 = "0.22"
+unicode-width = "0.2"
+arboard = { version = "3", default-features = false }
+# `lterm md` (and lterm run under the name `mdterm`) renders Markdown via mdterm.
+mdterm = { path = "mdterm" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+png = "0.17"
+embed-resource = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

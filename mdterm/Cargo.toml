@@ -1,0 +1,24 @@
+[package]
+name = "mdterm"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight cross-platform terminal renderer for Markdown and images"
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = []
+# Fetch http(s) images referenced from Markdown (adds a TLS stack).
+remote = ["dep:ureq"]
+
+[dependencies]
+pulldown-cmark = { version = "0.12", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+color_quant = "1.1"
+base64 = "0.22"
+unicode-width = "0.2"
+terminal_size = "0.4"
+ureq = { version = "2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+enable-ansi-support = "0.2"
