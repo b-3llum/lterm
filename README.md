@@ -9,6 +9,11 @@ A small, fast terminal for Windows and Linux with splits, tabs, tmux-style sessi
 | Splits across machines | Markdown with images |
 |---|---|
 | ![Four panes: two SSH servers, PowerShell and WSL](screenshots/split-screens.png) | ![lterm md rendering a README with its logo](screenshots/md-screenshot.png) |
+|||
+|**Help menu (Ctrl + space)**|**Image render**|
+|<img width="810" height="580" alt="image" src="https://github.com/user-attachments/assets/3f4445db-6836-4716-b736-ba9d0330c4d3" />|<img width="510" height="672" alt="image" src="https://github.com/user-attachments/assets/50493abb-fdb1-4f84-a20e-40376ac101f0" />|
+
+
 
 ## Install
 
