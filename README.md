@@ -1,5 +1,10 @@
 <p align="center"><img src="assets/logo.png" width="96" alt="lterm logo"></p>
 
+
+## Diagram 
+
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/b-3llum/lterm?utm_source=readme&utm_medium=badge)
+
 # lterm
 
 A small, fast terminal for Windows and Linux with splits, tabs, tmux-style sessions and inline images.
