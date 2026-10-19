@@ -116,6 +116,28 @@ It works in plain windows and in sessions (`--attach`), including while no windo
 agents keep reporting while you're detached and the window shows their state when you come back.
 `lterm pane --help` lists every option.
 
+### A browser in a pane, for agents
+
+![An agent's commands on the left driving a browser pane on the right, which shows the Rust website's Getting started page](screenshots/browser.png)
+
+`lterm browse` puts a real web browser in a pane: a headless Chrome or Edge, streamed in as
+images. Agents drive it with commands while you watch, and you can click, scroll and type in it
+too (`Ctrl+L` address, `Ctrl+B` / `Ctrl+F` back / forward, `Ctrl+R` reload, `Ctrl+Q` quit).
+
+```
+id=$(lterm browse open localhost:3000)    # a browser pane; prints its id
+lterm browse click --text "Sign in"       # or a CSS selector, or --at X Y
+lterm browse type --selector "#email" ada@example.com --enter
+lterm browse wait --text "Welcome"
+lterm browse text main                    # read the page (or links, html, eval JS)
+lterm browse shot page.png                # a screenshot an agent can look at
+```
+
+It works wherever lterm does: local windows, sessions (`--attach`) and over SSH, as long as
+Chrome, Edge or Chromium is installed where the pane runs. Each browser uses a fresh profile with
+no logins, deleted when it closes. Claude Code learns these commands from the `lterm-panes` skill.
+`lterm browse --help` lists them all.
+
 ## Shortcuts
 
 Press **Ctrl+Space**, let go, then press a key. **F1** shows every shortcut in the window.

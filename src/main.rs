@@ -4,6 +4,8 @@
 mod agents;
 mod app;
 mod askpass;
+mod browse;
+mod cdp;
 mod control;
 mod copymode;
 mod graphics;
@@ -44,6 +46,8 @@ USAGE:
     lterm keys                               Print the keyboard shortcuts
     lterm pane COMMAND                       From inside lterm: split, type into, read and
                                              wait for panes (lterm pane --help)
+    lterm browse [URL]                       A web browser in a pane, which agents can drive
+                                             (lterm browse --help)
     lterm integration install claude|codex   Show agents' state (working, blocked, done)
                                              on their panes (lterm integration --help)
     lterm push HOST                          Install lterm on a server over your SSH login
@@ -309,6 +313,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some("pane") => return control::main(&args[1..]),
+        Some("browse") => return browse::main(&args[1..]),
         Some("integration") => return integration::main(&args[1..]),
         Some("push") => return push::main(&args[1..]),
         Some("install") => return install::main(false),

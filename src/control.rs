@@ -427,7 +427,7 @@ USAGE:
     $LTERM_PANE). Exit status: 0 on success, 1 on errors, 2 if `wait` timed out.
 ";
 
-fn call(req: &Request) -> Reply {
+pub fn call(req: &Request) -> Reply {
     let addr = std::env::var("LTERM_SOCKET").map_err(|_| "not running inside lterm (LTERM_SOCKET isn't set)".to_string())?;
     let token = std::env::var("LTERM_TOKEN").unwrap_or_default();
     let payload = req.encode().join("\0");
