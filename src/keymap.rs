@@ -28,12 +28,16 @@ pub enum Cmd {
     FontSmaller,
     FontReset,
     ScrollPage(i32),
+    /// Show or hide the agents sidebar.
+    Sidebar,
+    /// Focus the next agent that needs you (blocked first, then done), in any tab.
+    NextAgent,
 }
 
 impl Cmd {
     /// Commands that can be repeated after one leader press (`l l l`, `L L L`, `n n`).
     pub fn repeatable(self) -> bool {
-        matches!(self, Cmd::Focus(..) | Cmd::Resize(..) | Cmd::NextPane | Cmd::NextTab | Cmd::PrevTab)
+        matches!(self, Cmd::Focus(..) | Cmd::Resize(..) | Cmd::NextPane | Cmd::NextTab | Cmd::PrevTab | Cmd::NextAgent)
     }
 }
 
@@ -135,6 +139,8 @@ pub fn leader_cmd(key: &Key, shift: bool) -> Option<Cmd> {
         'd' => Cmd::Detach,
         'r' => Cmd::Reconnect,
         '?' => Cmd::Help,
+        'a' => Cmd::Sidebar,
+        'u' => Cmd::NextAgent,
         _ => return None,
     })
 }
@@ -167,6 +173,7 @@ pub fn direct(code: KeyCode, m: ModifiersState) -> Option<Cmd> {
         KeyT if c && s => Cmd::NewTab,
         KeyX if c && s => Cmd::CopyMode,
         KeyF if c && s => Cmd::Search,
+        KeyA if c && s => Cmd::Sidebar,
         Tab if c => if s { Cmd::PrevTab } else { Cmd::NextTab },
         PageUp if c && !s => Cmd::PrevTab,
         PageDown if c && !s => Cmd::NextTab,
@@ -193,6 +200,7 @@ pub fn help(leader: &str) -> Vec<String> {
         "  n / p  next / prev tab  1-9  go to tab         Tab  next tab".into(),
         "  c  copy mode            /  search scrollback   ?  this help".into(),
         "  d  detach session       r  reconnect session".into(),
+        "  a  agents sidebar       u  next agent that needs you (repeat: u u u)".into(),
         format!("  {leader} twice sends it to the program;  Esc cancels"),
         String::new(),
         "Without the leader:".into(),
@@ -202,6 +210,7 @@ pub fn help(leader: &str) -> Vec<String> {
         "  Alt+1..9           go to tab                Ctrl+Shift+Z  zoom".into(),
         "  Ctrl+Shift+X       copy mode                Ctrl+Shift+F  search".into(),
         "  Ctrl+Shift+C / V   copy / paste             Ctrl+Shift+= / - / 0  font size".into(),
+        "  Ctrl+Shift+A       agents sidebar".into(),
         String::new(),
         "Copy mode:".into(),
         "  h j k l  w b  0 $  g G  Ctrl+U/D   move      v / V  select chars / lines".into(),
@@ -236,6 +245,8 @@ mod tests {
         assert_eq!(leader_cmd(&Key::Named(NamedKey::ArrowUp), true), Some(Cmd::Resize(0, -1)));
         assert_eq!(leader_cmd(&ch("3"), false), Some(Cmd::GoTab(2)));
         assert_eq!(leader_cmd(&ch("q"), false), None);
+        assert_eq!(leader_cmd(&ch("a"), false), Some(Cmd::Sidebar));
+        assert!(leader_cmd(&ch("u"), false).is_some_and(|c| c.repeatable()));
     }
 
     #[test]

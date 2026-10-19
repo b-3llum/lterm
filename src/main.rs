@@ -70,6 +70,7 @@ OPTIONS:
         --remote-cmd <C>  Command that starts lterm on the server [default: lterm via a login shell]
         --leader <KEYS>   Leader key, e.g. ctrl+space, ctrl+a, alt+space, f12
                           [default: ctrl+space, or $LTERM_LEADER]
+        --sidebar         Start with the agents sidebar open (leader then a toggles it)
         --font <FILE>     Monospace .ttf/.otf font
         --font-size <PX>  Font size in logical pixels [default: 15]
         --size <CxR>      Initial size in columns x rows [default: 100x30]
@@ -92,6 +93,7 @@ pub struct Options {
     pub session: String,
     pub remote_cmd: Option<String>,
     pub leader: String,
+    pub sidebar: bool,
     snapshot: Option<PathBuf>,
     snapshot_panes: usize,
     wait: f32,
@@ -110,6 +112,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         session: "main".into(),
         remote_cmd: None,
         leader: std::env::var("LTERM_LEADER").unwrap_or_else(|_| "ctrl+space".into()),
+        sidebar: false,
         snapshot: None,
         snapshot_panes: 1,
         wait: 5.0,
@@ -149,6 +152,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
             }
             "--remote-cmd" => o.remote_cmd = Some(value(&mut it, &arg)?),
             "--leader" => o.leader = value(&mut it, &arg)?,
+            "--sidebar" => o.sidebar = true,
             "--font" => o.font = Some(value(&mut it, &arg)?.into()),
             "--font-size" => o.font_size = num::<f32>(value(&mut it, &arg)?, &arg)?.clamp(4.0, 200.0),
             "--scrollback" => o.scrollback = num::<usize>(value(&mut it, &arg)?, &arg)?.min(1_000_000),

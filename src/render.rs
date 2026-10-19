@@ -503,11 +503,24 @@ pub struct TabLabel {
     pub dot: Option<u32>,
 }
 
+/// One agent in the sidebar: a dot in its state's color, its name and state, and a
+/// second line (what it's asking for, or where it is).
+pub struct SideEntry {
+    pub rect: Rect,
+    pub id: usize,
+    pub dot: u32,
+    pub head: String,
+    pub sub: String,
+    pub active: bool,
+}
+
 /// Window chrome drawn over the panes.
 #[derive(Default)]
 pub struct Ui<'a> {
     /// Tab bar: its area, the tabs, and text for the right end (session, status).
     pub bar: Option<(Rect, &'a [TabLabel], &'a str)>,
+    /// Agents sidebar: its area, the agents, and a hint for the bottom line.
+    pub sidebar: Option<(Rect, &'a [SideEntry], &'a str)>,
     /// A centered box of text (help, leader hint, messages).
     pub popup: Option<&'a [String]>,
 }
@@ -635,6 +648,37 @@ impl Renderer {
         self.text(canvas, bx + cw / 2, by, &a.label, bg, tw);
     }
 
+    fn draw_sidebar(&mut self, canvas: &mut Canvas, side: Rect, entries: &[SideEntry], hint: &str) {
+        let (cw, ch) = self.cell();
+        let (dim, quiet) = (0x9aa5ce, 0x565f89);
+        canvas.rect(side.x, side.y, side.w, side.h, 0x16161e);
+        canvas.rect(side.x, side.y, 1, side.h, self.theme.divider);
+        let x = side.x + self.pad + cw / 2;
+        let text_x = x + 2 * cw;
+        let max_w = (side.x + side.w).saturating_sub(text_x + self.pad);
+        self.text(canvas, x, side.y + self.pad, "Agents", dim, side.w);
+        if entries.is_empty() {
+            let lines = ["No agents yet. To show yours:", "", "  lterm integration", "    install claude"];
+            for (i, line) in lines.iter().enumerate() {
+                self.text(canvas, x, side.y + self.pad + (2 + i) * ch, line, quiet, side.w.saturating_sub(2 * self.pad));
+            }
+        }
+        for e in entries {
+            let r = e.rect;
+            if e.active {
+                canvas.rect(r.x + 1, r.y, r.w.saturating_sub(1), r.h, 0x24283b);
+            }
+            let y = r.y + self.pad / 2;
+            let d = (ch / 3).max(3);
+            canvas.rect(x + cw.saturating_sub(d) / 2, y + (ch - d) / 2, d, d, e.dot);
+            let fg = self.theme.fg;
+            self.text(canvas, text_x, y, &e.head, fg, max_w);
+            self.text(canvas, text_x, y + ch, &e.sub, dim, max_w);
+        }
+        let hy = (side.y + side.h).saturating_sub(ch + self.pad);
+        self.text(canvas, x, hy, hint, quiet, side.w.saturating_sub(2 * self.pad));
+    }
+
     fn draw_ui(&mut self, canvas: &mut Canvas, w: usize, h: usize, ui: &Ui) {
         let (cw, ch) = self.cell();
         let t = (self.theme.fg, self.theme.bg, self.theme.accent);
@@ -656,6 +700,9 @@ impl Renderer {
             let rw = self.text_width(right);
             let rx = (bar.x + bar.w).saturating_sub(rw + cw);
             self.text(canvas, rx, ty, right, 0x9aa5ce, rw);
+        }
+        if let Some((side, entries, hint)) = ui.sidebar {
+            self.draw_sidebar(canvas, side, entries, hint);
         }
         if let Some(lines) = ui.popup {
             let inner_w = lines.iter().map(|l| self.text_width(l)).max().unwrap_or(0);

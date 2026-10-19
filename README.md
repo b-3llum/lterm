@@ -55,7 +55,7 @@ lterm --attach user@server     # 2. connect. Split and add tabs freely, with no 
 
 ### Run coding agents side by side
 
-![Four panes: a lead shell listing agents, and Claude Code and Codex panes marked working, blocked and done](screenshots/agents.png)
+![A lead pane and two Claude Code panes, one working and one blocked on a permission prompt, with the agents sidebar listing them and a Codex agent that is done in another tab](screenshots/agents.png)
 
 lterm shows what each coding agent is doing, so you can run several at once and see which one needs you:
 
@@ -68,10 +68,16 @@ lterm shows what each coding agent is doing, so you can run several at once and 
 Tabs get a dot in the color of their most urgent agent, the tab bar counts agents by state, and the
 window flashes in the taskbar when an agent finishes or gets blocked while you're elsewhere.
 
+- **Agents sidebar:** `Ctrl+Space a` (or `Ctrl+Shift+A`, or start with `lterm --sidebar`) lists every agent
+  in every tab with its state or question. Click one to go to it.
+- **Next agent that needs you:** `Ctrl+Space u` jumps to a blocked agent first, then one that finished.
+  Keep tapping `u` to go through them.
+
 Turn it on once per agent (restart the agent afterwards):
 
 ```
-lterm integration install claude   # Claude Code: hooks in ~/.claude/settings.json (backup kept)
+lterm integration install claude   # Claude Code: hooks in ~/.claude/settings.json (backup kept),
+                                   #   plus the lterm-panes skill (see below)
 lterm integration install codex    # Codex: notify in ~/.codex/config.toml
 lterm integration                  # show what's installed; `uninstall` removes it
 ```
@@ -96,6 +102,11 @@ lterm pane list                       # every pane: id, tab, size, focus, agent 
 lterm pane close $id
 ```
 
+With the integration installed, Claude Code also gets the `lterm-panes` skill, so you can simply ask it:
+*"split this refactor across two helpers in panes and review their work"*. It writes each helper a task
+file, starts them in splits, waits for them, and reads their results. It won't answer a helper's
+permission prompts for you: it tells you which pane needs you.
+
 It works in plain windows and in sessions (`--attach`), including while no window is attached;
 agents keep reporting while you're detached and the window shows their state when you come back.
 `lterm pane --help` lists every option.
@@ -113,6 +124,7 @@ Press **Ctrl+Space**, let go, then press a key. **F1** shows every shortcut in t
 | `z` | zoom pane / restore | `c` | copy mode |
 | `x` | close pane | `/` | search scrollback |
 | `?` | help | `d` / `r` | detach / reconnect |
+| `a` | agents sidebar | `u` | next agent that needs you |
 
 **Without the leader:**
 
@@ -124,6 +136,7 @@ Press **Ctrl+Space**, let go, then press a key. **F1** shows every shortcut in t
 | Ctrl+Shift+W / Z | close / zoom pane |
 | Ctrl+Shift+C / V | copy / paste (right-click also copies or pastes) |
 | Ctrl+Shift+F | search scrollback |
+| Ctrl+Shift+A | agents sidebar |
 | Ctrl+Shift+= / - / 0 | font size bigger / smaller / reset |
 | Shift+PageUp / PageDown | scroll history (or use the mouse wheel) |
 

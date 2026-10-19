@@ -20,7 +20,7 @@ use crate::copymode::{CopyMode, Outcome};
 use crate::keymap::{self, Cmd, Leader};
 use crate::layout::{self, Dir, Node, Rect, Tab};
 use crate::pty::{self, Pty, PtyMsg};
-use crate::render::{self, AgentBadge, CopyView, Fonts, PaneView, Renderer, TabLabel, Ui};
+use crate::render::{self, AgentBadge, CopyView, Fonts, PaneView, Renderer, SideEntry, TabLabel, Ui};
 use crate::session::{self, ConnEvent, Connection, Frame, Target};
 use crate::term::{MouseMode, Selection, Term};
 use crate::{fatal, input, logo, Options};
@@ -120,6 +120,10 @@ pub struct App {
     dividers: Vec<Rect>,
     bar: Option<Rect>,
     tab_labels: Vec<TabLabel>,
+    /// The agents sidebar: shown or not, where it is, and its entries (kept for clicks).
+    sidebar: bool,
+    side: Option<Rect>,
+    side_entries: Vec<SideEntry>,
     backend: Backend,
     /// Where `lterm pane` reaches this window (local panes only; a session server
     /// serves its own panes).
@@ -159,6 +163,7 @@ impl App {
             }
             Backend::Remote { .. } => None,
         };
+        let sidebar = opts.sidebar;
         App {
             font_size: opts.font_size,
             opts,
@@ -173,6 +178,9 @@ impl App {
             dividers: Vec::new(),
             bar: None,
             tab_labels: Vec::new(),
+            sidebar,
+            side: None,
+            side_entries: Vec::new(),
             backend,
             control,
             leader,
@@ -348,12 +356,21 @@ impl App {
         id
     }
 
-    /// The area panes get: the window minus the tab bar.
+    /// The area panes get: the window minus the tab bar and the sidebar.
     fn pane_area(&self) -> Rect {
         let Some(gui) = &self.gui else { return Rect::default() };
         let size = gui.window.inner_size();
         let bar = self.bar.map_or(0, |b| b.h);
-        Rect { x: 0, y: bar, w: size.width as usize, h: (size.height as usize).saturating_sub(bar) }
+        let w = (size.width as usize).saturating_sub(self.side_width(size.width as usize));
+        Rect { x: 0, y: bar, w, h: (size.height as usize).saturating_sub(bar) }
+    }
+
+    /// Width of the agents sidebar in a window `w` pixels wide (0 when hidden).
+    fn side_width(&self, w: usize) -> usize {
+        match (&self.renderer, self.sidebar) {
+            (Some(r), true) => (34 * r.cell().0 + 2 * r.pad).min(w / 3),
+            _ => 0,
+        }
     }
 
     fn new_tab(&mut self) {
@@ -611,7 +628,9 @@ impl App {
         let show_bar = self.tabs.len() > 1 || remote || self.panes.values().any(|p| p.agent.is_some());
         let bar_h = if show_bar { r.cell().1 + r.pad } else { 0 };
         self.bar = show_bar.then_some(Rect { x: 0, y: 0, w, h: bar_h });
-        let area = Rect { x: 0, y: bar_h, w, h: h.saturating_sub(bar_h) };
+        let side_w = self.side_width(w);
+        self.side = (side_w > 0).then_some(Rect { x: w - side_w, y: bar_h, w: side_w, h: h.saturating_sub(bar_h) });
+        let area = Rect { x: 0, y: bar_h, w: w - side_w, h: h.saturating_sub(bar_h) };
         self.rects.clear();
         self.dividers.clear();
         if let Some(tab) = self.tabs.get(self.active) {
@@ -721,6 +740,35 @@ impl App {
         }
 
         let focus = self.tabs.get(self.active).map_or(usize::MAX, |t| t.focus);
+
+        // The agents sidebar: every pane with an agent, in tab order; kept for clicks.
+        self.side_entries.clear();
+        if let Some(side) = self.side {
+            let ch = r.cell().1;
+            let h = 2 * ch + r.pad;
+            let mut y = side.y + r.pad + 2 * ch;
+            'tabs: for (ti, tab) in self.tabs.iter().enumerate() {
+                for id in tab.tree.leaves() {
+                    let Some(p) = self.panes.get(&id) else { continue };
+                    let (Some(a), Some((dot, _, _))) = (p.agent.as_ref(), p.agent_look()) else { continue };
+                    if y + h > side.y + side.h.saturating_sub(2 * ch) {
+                        break 'tabs;
+                    }
+                    let title = if p.title.is_empty() { "shell" } else { p.title.as_str() };
+                    let sub = match a.state {
+                        AgentState::Blocked if !a.message.is_empty() => a.message.clone(),
+                        AgentState::Blocked => "needs you".into(),
+                        _ => format!("tab {} · {title}", ti + 1),
+                    };
+                    let head = format!("{}  {}", a.name, a.state.name());
+                    let rect = Rect { x: side.x, y, w: side.w, h };
+                    self.side_entries.push(SideEntry { rect, id, dot, head, sub, active: ti == self.active && id == focus });
+                    y += h;
+                }
+            }
+        }
+        let side_hint = format!("{} u: next that needs you", self.leader.label());
+
         let views: Vec<PaneView> = self
             .rects
             .iter()
@@ -732,7 +780,11 @@ impl App {
             })
             .collect();
         let outline = if self.rects.len() > 1 { self.rects.iter().find(|(id, _)| *id == focus).map(|(_, r)| *r) } else { None };
-        let ui = Ui { bar: self.bar.map(|b| (b, &self.tab_labels[..], right.as_str())), popup: popup.as_deref() };
+        let ui = Ui {
+            bar: self.bar.map(|b| (b, &self.tab_labels[..], right.as_str())),
+            sidebar: self.side.map(|s| (s, &self.side_entries[..], side_hint.as_str())),
+            popup: popup.as_deref(),
+        };
         let Ok(mut buf) = gui.surface.buffer_mut() else { return };
         r.draw(&mut buf[..], size.width as usize, size.height as usize, &views, &self.dividers, outline, &ui);
         let _ = buf.present();
@@ -937,6 +989,28 @@ impl App {
                 self.connect();
             }
             Cmd::Help => self.help = true,
+            Cmd::Sidebar => {
+                self.sidebar = !self.sidebar;
+                self.relayout();
+            }
+            Cmd::NextAgent => {
+                // Panes whose agent wants you, most urgent first, in tab order.
+                let mut urgent: Vec<(u8, usize)> = Vec::new();
+                for tab in &self.tabs {
+                    for id in tab.tree.leaves() {
+                        if let Some((_, _, u)) = self.panes.get(&id).and_then(|p| p.agent_look()).filter(|l| l.2 >= 2) {
+                            urgent.push((u, id));
+                        }
+                    }
+                }
+                urgent.sort_by_key(|&(u, _)| std::cmp::Reverse(u));
+                let next = match urgent.iter().position(|&(_, id)| id == focus) {
+                    Some(i) => urgent.get(i + 1).or(urgent.first()),
+                    None => urgent.first(),
+                };
+                let Some(&(_, id)) = next.filter(|&&(_, id)| id != focus) else { return false };
+                self.focus_pane(id);
+            }
             Cmd::Copy => self.copy(),
             Cmd::Paste => self.paste(),
             Cmd::FontBigger => self.zoom_font(1.0),
@@ -1062,6 +1136,17 @@ impl App {
             let hit = self.tab_labels.iter().position(|t| t.rect.contains(self.mouse.x, self.mouse.y));
             if let Some(i) = hit {
                 self.switch_tab(i);
+            }
+            return;
+        }
+        // Agents sidebar: click an agent to go to its pane.
+        if self.side.is_some_and(|s| s.contains(self.mouse.x, self.mouse.y)) {
+            if pressed {
+                let hit = self.side_entries.iter().find(|e| e.rect.contains(self.mouse.x, self.mouse.y)).map(|e| e.id);
+                if let Some(id) = hit {
+                    self.focus_pane(id);
+                    self.request_redraw();
+                }
             }
             return;
         }
