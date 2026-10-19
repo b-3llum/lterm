@@ -1,6 +1,7 @@
 // A console-subsystem program on purpose, so `lterm md` and `lterm -h` can print to the
 // shell they were run from. In window mode it detaches from that console (see `detach_console`).
 
+mod agents;
 mod app;
 mod askpass;
 mod control;

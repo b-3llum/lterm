@@ -15,6 +15,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Icon, UserAttentionType, Window, WindowId};
 
+use crate::agents::{self, Look, Seat};
 use crate::control::{self, Agent, AgentState, Endpoint, Reply, Request};
 use crate::copymode::{CopyMode, Outcome};
 use crate::keymap::{self, Cmd, Leader};
@@ -57,32 +58,22 @@ struct Pane {
     seen: bool,
 }
 
-const WORKING: u32 = 0xe0af68;
-const BLOCKED: u32 = 0xf7768e;
-const DONE: u32 = 0x9ece6a;
-const QUIET: u32 = 0x565f89;
-
 impl Pane {
-    fn agent_look(&self) -> Option<(u32, bool, u8)> {
-        agent_look(self.agent.as_ref(), self.seen)
+    fn seat(&self, id: usize) -> Seat<'_> {
+        Seat { id, agent: self.agent.as_ref(), seen: self.seen, title: &self.title }
     }
 }
 
-/// How an agent shows: color, whether its pane gets a border, and urgency (for the tab
-/// dot: blocked, then unseen done, then working).
-fn agent_look(agent: Option<&Agent>, seen: bool) -> Option<(u32, bool, u8)> {
-    Some(match agent?.state {
-        AgentState::Blocked => (BLOCKED, true, 3),
-        AgentState::Done if !seen => (DONE, true, 2),
-        AgentState::Working => (WORKING, true, 1),
-        AgentState::Done | AgentState::Idle => (QUIET, false, 0),
-    })
+/// Each tab's panes, in order, as the agent decisions see them.
+fn seats<'a>(tabs: &[Tab], panes: &'a HashMap<usize, Pane>) -> Vec<Vec<Seat<'a>>> {
+    let seats = |t: &Tab| t.tree.leaves().into_iter().filter_map(|id| Some(panes.get(&id)?.seat(id))).collect();
+    tabs.iter().map(seats).collect()
 }
 
 /// The border and label for a pane's agent.
 pub fn agent_badge(agent: Option<&Agent>, seen: bool) -> Option<AgentBadge> {
     let a = agent?;
-    let (color, border, _) = agent_look(agent, seen)?;
+    let Look { color, border, .. } = agents::look(agent, seen)?;
     let what = match a.state {
         AgentState::Blocked if !a.message.is_empty() => a.message.as_str(),
         AgentState::Blocked => "needs you",
@@ -694,13 +685,7 @@ impl App {
     }
 
     fn bar_text(&self) -> String {
-        let mut parts = Vec::new();
-        for (urgency, what) in [(3, "blocked"), (2, "done"), (1, "working")] {
-            let n = self.panes.values().filter(|p| p.agent_look().is_some_and(|l| l.2 == urgency)).count();
-            if n > 0 {
-                parts.push(format!("{n} {what}"));
-            }
-        }
+        let mut parts = agents::summary(self.panes.iter().map(|(&id, p)| p.seat(id)));
         match &self.backend {
             Backend::Remote { target, attached: true, .. } => parts.push(format!("session {} @ {}", self.opts.session, target.label())),
             Backend::Remote { .. } => parts.push(self.status.clone()),
@@ -722,6 +707,8 @@ impl App {
             gui.size = (size.width, size.height);
         }
 
+        let seats = seats(&self.tabs, &self.panes);
+
         // Tab labels; kept for mouse clicks.
         self.tab_labels.clear();
         if let Some(bar) = self.bar {
@@ -730,8 +717,7 @@ impl App {
                 let title = self.panes.get(&tab.focus).map(|p| p.title.as_str()).filter(|t| !t.is_empty());
                 let title: String = title.unwrap_or("shell").chars().take(20).collect();
                 let text = format!("{} {title}", i + 1);
-                let looks = tab.tree.leaves().into_iter().filter_map(|id| self.panes.get(&id)?.agent_look());
-                let dot = looks.filter(|l| l.2 > 0).max_by_key(|l| l.2).map(|l| l.0);
+                let dot = agents::tab_dot(&seats[i]);
                 let tw = r.text_width(&text) + r.fonts.cell_w * if dot.is_some() { 3 } else { 1 };
                 let rect = Rect { x, y: bar.y, w: tw, h: bar.h };
                 self.tab_labels.push(TabLabel { rect, text, active: i == self.active, dot });
@@ -747,24 +733,14 @@ impl App {
             let ch = r.cell().1;
             let h = 2 * ch + r.pad;
             let mut y = side.y + r.pad + 2 * ch;
-            'tabs: for (ti, tab) in self.tabs.iter().enumerate() {
-                for id in tab.tree.leaves() {
-                    let Some(p) = self.panes.get(&id) else { continue };
-                    let (Some(a), Some((dot, _, _))) = (p.agent.as_ref(), p.agent_look()) else { continue };
-                    if y + h > side.y + side.h.saturating_sub(2 * ch) {
-                        break 'tabs;
-                    }
-                    let title = if p.title.is_empty() { "shell" } else { p.title.as_str() };
-                    let sub = match a.state {
-                        AgentState::Blocked if !a.message.is_empty() => a.message.clone(),
-                        AgentState::Blocked => "needs you".into(),
-                        _ => format!("tab {} · {title}", ti + 1),
-                    };
-                    let head = format!("{}  {}", a.name, a.state.name());
-                    let rect = Rect { x: side.x, y, w: side.w, h };
-                    self.side_entries.push(SideEntry { rect, id, dot, head, sub, active: ti == self.active && id == focus });
-                    y += h;
+            for row in agents::rows(&seats) {
+                if y + h > side.y + side.h.saturating_sub(2 * ch) {
+                    break;
                 }
+                let rect = Rect { x: side.x, y, w: side.w, h };
+                let active = row.tab == self.active && row.id == focus;
+                self.side_entries.push(SideEntry { rect, id: row.id, dot: row.dot, head: row.head, sub: row.sub, active });
+                y += h;
             }
         }
         let side_hint = format!("{} u: next that needs you", self.leader.label());
@@ -994,21 +970,7 @@ impl App {
                 self.relayout();
             }
             Cmd::NextAgent => {
-                // Panes whose agent wants you, most urgent first, in tab order.
-                let mut urgent: Vec<(u8, usize)> = Vec::new();
-                for tab in &self.tabs {
-                    for id in tab.tree.leaves() {
-                        if let Some((_, _, u)) = self.panes.get(&id).and_then(|p| p.agent_look()).filter(|l| l.2 >= 2) {
-                            urgent.push((u, id));
-                        }
-                    }
-                }
-                urgent.sort_by_key(|&(u, _)| std::cmp::Reverse(u));
-                let next = match urgent.iter().position(|&(_, id)| id == focus) {
-                    Some(i) => urgent.get(i + 1).or(urgent.first()),
-                    None => urgent.first(),
-                };
-                let Some(&(_, id)) = next.filter(|&&(_, id)| id != focus) else { return false };
+                let Some(id) = agents::next_urgent(&seats(&self.tabs, &self.panes), focus) else { return false };
                 self.focus_pane(id);
             }
             Cmd::Copy => self.copy(),
@@ -1345,11 +1307,22 @@ impl App {
 
     /// Focus pane `id`, switching to its tab.
     fn focus_pane(&mut self, id: usize) {
-        if let Some(ti) = self.tabs.iter().position(|t| t.tree.contains(id)) {
-            self.switch_tab(ti);
-            self.set_focus(id);
+        match aim_tab(&mut self.tabs, self.active, id) {
+            Some(ti) if ti == self.active => self.set_focus(id),
+            Some(ti) => self.switch_tab(ti),
+            None => {}
         }
     }
+}
+
+/// The tab holding pane `id`. Another tab than `active` is pointed at `id` before it is
+/// shown, so the pane it had focused isn't marked seen without ever being on screen.
+fn aim_tab(tabs: &mut [Tab], active: usize, id: usize) -> Option<usize> {
+    let ti = tabs.iter().position(|t| t.tree.contains(id))?;
+    if ti != active {
+        tabs[ti].focus = id;
+    }
+    Some(ti)
 }
 
 // ---------------------------------------------------------------- sessions
@@ -1485,5 +1458,25 @@ impl App {
         }
         self.relayout();
         self.update_title();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aim_tab_skips_the_old_focus() {
+        // Tab 2 shows pane 1, its agent done and unseen; "next agent" goes to blocked pane 2.
+        let mut right = Node::Leaf(1);
+        right.split(1, Dir::Right, 2);
+        let mut tabs = vec![Tab { tree: Node::Leaf(0), focus: 0, zoomed: false }, Tab { tree: right, focus: 1, zoomed: false }];
+        assert_eq!(aim_tab(&mut tabs, 0, 2), Some(1));
+        // Switching to tab 2 now shows (and marks seen) pane 2, not pane 1.
+        assert_eq!(tabs[1].focus, 2);
+        // Within the active tab, set_focus moves the focus.
+        assert_eq!(aim_tab(&mut tabs, 1, 1), Some(1));
+        assert_eq!(tabs[1].focus, 2);
+        assert_eq!(aim_tab(&mut tabs, 0, 9), None);
     }
 }
