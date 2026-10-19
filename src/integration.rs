@@ -333,6 +333,36 @@ fn codex_line() -> Result<String, String> {
     Ok(format!("notify = [\"{exe}\", \"pane\", \"state\", \"done\", \"--agent\", \"codex\"]  # added by lterm integration"))
 }
 
+/// How Codex's `notify` line involves lterm.
+#[derive(Debug, PartialEq)]
+enum Notify {
+    /// It's lterm's own line.
+    Ours,
+    /// Another program runs first and then calls lterm's command (the Codex app does this:
+    /// it wraps the previous `notify` as `--previous-notify '[...]'`). Holds that program's
+    /// name and the lterm path it calls.
+    Chained(String, String),
+    Other,
+}
+
+const CODEX_ARGS: &str = r#""pane","state","done","--agent","codex""#;
+
+fn classify(line: &str) -> Notify {
+    // Compare without spaces or the escaping a nested JSON array has.
+    let compact: String = line.chars().filter(|c| !c.is_whitespace() && *c != '\\').collect();
+    let Some(at) = compact.find(CODEX_ARGS) else { return Notify::Other };
+    // `..."PATH","pane",...`: PATH is the quoted string just before the arguments.
+    let before = compact[..at].trim_end_matches(',').trim_end_matches('"');
+    let lterm = before.rfind(['"', '[']).map_or("", |i| &before[i + 1..]).to_string();
+    let array = compact.strip_prefix("notify=[").unwrap_or("");
+    if line.contains("added by lterm") || array.starts_with(&format!("\"{lterm}\",{CODEX_ARGS}]")) {
+        return Notify::Ours;
+    }
+    let first = line.split_once('[').and_then(|(_, r)| r.split('"').nth(1)).unwrap_or("");
+    let name = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    Notify::Chained(name.to_string(), lterm)
+}
+
 fn install_codex() -> Result<String, String> {
     let path = codex_config()?;
     let text = match std::fs::read_to_string(&path) {
@@ -344,14 +374,24 @@ fn install_codex() -> Result<String, String> {
     let top = top_level(&lines);
     let line = codex_line()?;
     match lines[..top].iter().position(|l| is_notify(l)) {
-        Some(i) if lines[i].contains("added by lterm") => lines[i] = line,
-        Some(i) => {
-            return Err(format!(
-                "{} already runs a notify command:\n    {}\nCodex allows one. Add `lterm pane state done --agent codex` to it instead.",
-                path.display(),
-                lines[i].trim()
-            ))
-        }
+        Some(i) => match classify(&lines[i]) {
+            Notify::Ours => lines[i] = line,
+            Notify::Chained(by, lterm) => {
+                let note = if Path::new(&lterm).is_file() {
+                    String::new()
+                } else {
+                    format!("\nBut {lterm} doesn't exist any more: remove that entry and install again.")
+                };
+                return Ok(format!("Already installed: Codex runs {by}, which then calls lterm ({lterm}).{note}\n"));
+            }
+            Notify::Other => {
+                return Err(format!(
+                    "{} already runs a notify command:\n    {}\nCodex allows one. Add `lterm pane state done --agent codex` to it instead.",
+                    path.display(),
+                    lines[i].trim()
+                ))
+            }
+        },
         None => lines.insert(0, line),
     }
     write_file(&path, &(lines.join("\n") + "\n"))?;
@@ -362,14 +402,20 @@ fn uninstall_codex() -> Result<String, String> {
     let path = codex_config()?;
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(format!("No {}.\n", path.display())) };
     let lines: Vec<&str> = text.lines().collect();
-    let kept: Vec<&str> = lines.iter().copied().filter(|l| !(is_notify(l) && l.contains("added by lterm"))).collect();
+    if let Some(Notify::Chained(by, _)) = lines.iter().find(|l| is_notify(l)).map(|l| classify(l)) {
+        return Err(format!(
+            "{by} calls lterm from inside its own notify command in {}; lterm won't edit another \
+             program's entry. Remove the lterm part (`--previous-notify`) by hand, or through that program.",
+            path.display()
+        ));
+    }
+    let kept: Vec<&str> = lines.iter().copied().filter(|l| !(is_notify(l) && classify(l) == Notify::Ours)).collect();
     if kept.len() == lines.len() {
         return Ok(format!("No lterm notify in {}.\n", path.display()));
     }
     write_file(&path, &(kept.join("\n") + "\n"))?;
     Ok(format!("Removed lterm's notify from {}.\n", path.display()))
 }
-
 fn status() -> String {
     let claude = claude_settings().ok().map(|p| {
         let n = read_json(&p).ok().map_or(0, |mut root| remove_claude_hooks(&mut root));
@@ -383,8 +429,12 @@ fn status() -> String {
         format!("    claude  {state}  ({})\n", p.display())
     });
     let codex = codex_config().ok().map(|p| {
-        let on = std::fs::read_to_string(&p).is_ok_and(|t| t.lines().any(|l| is_notify(l) && l.contains("added by lterm")));
-        let state = if on { "installed" } else { "not installed" };
+        let line = std::fs::read_to_string(&p).ok().and_then(|t| t.lines().find(|l| is_notify(l)).map(classify));
+        let state = match line {
+            Some(Notify::Ours) => "installed".to_string(),
+            Some(Notify::Chained(by, _)) => format!("installed (called by {by})"),
+            _ => "not installed".to_string(),
+        };
         format!("    codex   {state}  ({})\n", p.display())
     });
     claude.unwrap_or_default() + &codex.unwrap_or_default()
@@ -424,5 +474,13 @@ mod tests {
         let lines: Vec<String> = ["model = \"o3\"", "notify = [\"x\"]", "[tui]", "notify = true"].map(String::from).to_vec();
         assert_eq!(top_level(&lines), 2);
         assert!(is_notify(&lines[1]) && !is_notify("notifyx = 1") && !is_notify(&lines[0]));
+
+        let ours = r#"notify = ["C:/x/lterm.exe", "pane", "state", "done", "--agent", "codex"]"#;
+        assert_eq!(classify(ours), Notify::Ours);
+        assert_eq!(classify(&format!("{ours}  # added by lterm integration")), Notify::Ours);
+        // The Codex app wraps the previous notify in its own.
+        let chained = r#"notify = [ "C:\\Codex\\bin\\codex-computer-use.exe", "turn-ended", "--previous-notify", "[\"C:/x/lterm.exe\",\"pane\",\"state\",\"done\",\"--agent\",\"codex\"]" ]"#;
+        assert_eq!(classify(chained), Notify::Chained("codex-computer-use.exe".into(), "C:/x/lterm.exe".into()));
+        assert_eq!(classify(r#"notify = ["my-script"]"#), Notify::Other);
     }
 }
