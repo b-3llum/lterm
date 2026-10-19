@@ -20,6 +20,8 @@ miniz_oxide = "0.8"
 base64 = "0.22"
 unicode-width = "0.2"
 arboard = { version = "3", default-features = false }
+# `lterm integration` edits agents' JSON settings, keeping the user's key order.
+serde_json = { version = "1", features = ["preserve_order"] }
 # `lterm md` (and lterm run under the name `mdterm`) renders Markdown via mdterm.
 mdterm = { path = "mdterm" }
 

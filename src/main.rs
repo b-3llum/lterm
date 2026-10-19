@@ -8,6 +8,7 @@ mod copymode;
 mod graphics;
 mod input;
 mod install;
+mod integration;
 mod keymap;
 mod layout;
 mod logo;
@@ -42,6 +43,8 @@ USAGE:
     lterm keys                               Print the keyboard shortcuts
     lterm pane COMMAND                       From inside lterm: split, type into, read and
                                              wait for panes (lterm pane --help)
+    lterm integration install claude|codex   Show agents' state (working, blocked, done)
+                                             on their panes (lterm integration --help)
     lterm push HOST                          Install lterm on a server over your SSH login
     lterm install                            Install for this user (PATH, app menu / Start menu)
     lterm uninstall                          Undo `lterm install`
@@ -301,6 +304,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some("pane") => return control::main(&args[1..]),
+        Some("integration") => return integration::main(&args[1..]),
         Some("push") => return push::main(&args[1..]),
         Some("install") => return install::main(false),
         Some("uninstall") => return install::main(true),
@@ -346,6 +350,7 @@ fn render_png(
     (w, h): (usize, usize),
     tree: &Node,
     terms: &HashMap<usize, Term>,
+    agents: &HashMap<usize, control::Agent>,
 ) -> Result<(), String> {
     let (mut rects, mut dividers) = (Vec::new(), Vec::new());
     tree.layout(Rect { x: 0, y: 0, w, h }, 2, &mut rects, &mut dividers);
@@ -354,7 +359,8 @@ fn render_png(
         .iter()
         .filter_map(|&(id, rect)| {
             let term = terms.get(&id)?;
-            Some(PaneView { term, rect, selection: None, focused: Some(id) == first, copy: None })
+            let agent = app::agent_badge(agents.get(&id), false);
+            Some(PaneView { term, rect, selection: None, focused: Some(id) == first, copy: None, agent })
         })
         .collect();
     let outline = (rects.len() > 1).then(|| rects[0].1);
@@ -419,7 +425,7 @@ fn snapshot(opts: &Options, path: &Path) -> Result<(), String> {
         }
     }
     drop(ptys);
-    render_png(&mut renderer, path, (w, h), &tree, &terms)
+    render_png(&mut renderer, path, (w, h), &tree, &terms, &HashMap::new())
 }
 
 /// Attach to a session headless: start it with COMMAND if it's new, collect output for
@@ -435,6 +441,7 @@ fn snapshot_session(opts: &Options, path: &Path) -> Result<(), String> {
     let mut terms: HashMap<usize, Term> = HashMap::new();
     let mut parsers: HashMap<usize, vte::Parser> = HashMap::new();
     let mut layout_text = String::new();
+    let mut agents = HashMap::new();
     let mut welcomed = false;
     let deadline = Instant::now() + Duration::from_secs_f32(opts.wait.max(0.1));
     while let Ok(ev) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -465,6 +472,12 @@ fn snapshot_session(opts: &Options, path: &Path) -> Result<(), String> {
             ConnEvent::Frame(Frame::Exited { id }) => {
                 terms.remove(&(id as usize));
             }
+            ConnEvent::Frame(Frame::Agent { id, state, name, message }) => {
+                match control::AgentState::from_code(state) {
+                    Some(state) => agents.insert(id as usize, control::Agent { name, state, message, reports_working: false }),
+                    None => agents.remove(&(id as usize)),
+                };
+            }
             ConnEvent::Frame(_) => {}
             ConnEvent::Closed(msg) if !welcomed => return Err(msg),
             ConnEvent::Closed(_) => break,
@@ -481,7 +494,7 @@ fn snapshot_session(opts: &Options, path: &Path) -> Result<(), String> {
         .or_else(|| terms.keys().min().map(|&id| Node::Leaf(id)))
         .ok_or("the session has no panes")?;
     drop(conn); // detach
-    render_png(&mut renderer, path, (w, h), &tree, &terms)
+    render_png(&mut renderer, path, (w, h), &tree, &terms, &agents)
 }
 
 pub(crate) fn write_rgba_png(path: &Path, rgba: &[u8], w: usize, h: usize) -> Result<(), String> {

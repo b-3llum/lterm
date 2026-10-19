@@ -15,12 +15,12 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Icon, UserAttentionType, Window, WindowId};
 
-use crate::control::{self, Endpoint, Reply, Request};
+use crate::control::{self, Agent, AgentState, Endpoint, Reply, Request};
 use crate::copymode::{CopyMode, Outcome};
 use crate::keymap::{self, Cmd, Leader};
 use crate::layout::{self, Dir, Node, Rect, Tab};
 use crate::pty::{self, Pty, PtyMsg};
-use crate::render::{self, CopyView, Fonts, PaneView, Renderer, TabLabel, Ui};
+use crate::render::{self, AgentBadge, CopyView, Fonts, PaneView, Renderer, TabLabel, Ui};
 use crate::session::{self, ConnEvent, Connection, Frame, Target};
 use crate::term::{MouseMode, Selection, Term};
 use crate::{fatal, input, logo, Options};
@@ -51,6 +51,44 @@ struct Pane {
     title: String,
     copy: Option<CopyMode>,
     last_output: Instant,
+    /// The coding agent running here, if one reported in (`lterm pane state`).
+    agent: Option<Agent>,
+    /// Its latest "done" or "blocked" has been on screen in the focused pane.
+    seen: bool,
+}
+
+const WORKING: u32 = 0xe0af68;
+const BLOCKED: u32 = 0xf7768e;
+const DONE: u32 = 0x9ece6a;
+const QUIET: u32 = 0x565f89;
+
+impl Pane {
+    fn agent_look(&self) -> Option<(u32, bool, u8)> {
+        agent_look(self.agent.as_ref(), self.seen)
+    }
+}
+
+/// How an agent shows: color, whether its pane gets a border, and urgency (for the tab
+/// dot: blocked, then unseen done, then working).
+fn agent_look(agent: Option<&Agent>, seen: bool) -> Option<(u32, bool, u8)> {
+    Some(match agent?.state {
+        AgentState::Blocked => (BLOCKED, true, 3),
+        AgentState::Done if !seen => (DONE, true, 2),
+        AgentState::Working => (WORKING, true, 1),
+        AgentState::Done | AgentState::Idle => (QUIET, false, 0),
+    })
+}
+
+/// The border and label for a pane's agent.
+pub fn agent_badge(agent: Option<&Agent>, seen: bool) -> Option<AgentBadge> {
+    let a = agent?;
+    let (color, border, _) = agent_look(agent, seen)?;
+    let what = match a.state {
+        AgentState::Blocked if !a.message.is_empty() => a.message.as_str(),
+        AgentState::Blocked => "needs you",
+        s => s.name(),
+    };
+    Some(AgentBadge { label: format!("{}: {what}", a.name), color, border })
 }
 
 enum LeaderState {
@@ -217,6 +255,7 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 self.focus_event(self.focus(), focused);
+                self.mark_seen();
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
@@ -302,6 +341,8 @@ impl App {
             title: String::new(),
             copy: None,
             last_output: Instant::now(),
+            agent: None,
+            seen: true,
         };
         self.panes.insert(id, pane);
         id
@@ -344,6 +385,7 @@ impl App {
         self.focus_event(self.focus(), false);
         self.active = i;
         self.focus_event(self.focus(), self.focused);
+        self.mark_seen();
         self.selecting = false;
         self.relayout();
         self.update_title();
@@ -443,6 +485,7 @@ impl App {
         self.focus_event(old, false);
         self.tabs[self.active].focus = id;
         self.focus_event(id, self.focused);
+        self.mark_seen();
         self.selecting = false;
         self.pressed = None;
         if self.tabs[self.active].zoomed {
@@ -498,6 +541,8 @@ impl App {
                 pty.write(&replies);
             }
         }
+        // In a session the server reads notifications and reports the agent's state.
+        let note = p.term.notification.take().filter(|_| !p.remote);
         let new_title = p.term.title.take().map(|t| p.title = t).is_some();
         let bell = take(&mut p.term.bell);
         if new_title && id == self.focus() {
@@ -508,6 +553,44 @@ impl App {
                 gui.window.request_user_attention(Some(UserAttentionType::Informational));
             }
             gui.window.request_redraw();
+        }
+        if let Some(note) = note {
+            self.update_agent(id, |a| Agent::notified(a, &note));
+        }
+    }
+
+    /// Change pane `id`'s agent with `change` (which says whether it changed anything).
+    /// A new "blocked" or "done" asks for attention unless it's in front of you.
+    fn update_agent(&mut self, id: usize, change: impl FnOnce(&mut Option<Agent>) -> bool) {
+        let watching = self.focused && id == self.focus();
+        let Some(p) = self.panes.get_mut(&id) else { return };
+        let (prev, had) = (p.agent.as_ref().map(|a| a.state), p.agent.is_some());
+        if !change(&mut p.agent) {
+            return;
+        }
+        let now = p.agent.as_ref().map(|a| a.state);
+        if now != prev {
+            p.seen = watching;
+            if matches!(now, Some(AgentState::Blocked | AgentState::Done)) && !self.focused {
+                if let Some(gui) = &self.gui {
+                    gui.window.request_user_attention(Some(UserAttentionType::Informational));
+                }
+            }
+        }
+        if had != p.agent.is_some() {
+            self.relayout(); // the tab bar shows while any pane has an agent
+        }
+        self.request_redraw();
+    }
+
+    /// The focused pane is in front of the user: its agent's "done" has been seen.
+    fn mark_seen(&mut self) {
+        let focus = self.focus();
+        if let (true, Some(p)) = (self.focused, self.panes.get_mut(&focus)) {
+            if !p.seen {
+                p.seen = true;
+                self.request_redraw();
+            }
         }
     }
 }
@@ -525,7 +608,7 @@ impl App {
             return;
         }
         let (w, h) = (size.width as usize, size.height as usize);
-        let show_bar = self.tabs.len() > 1 || remote;
+        let show_bar = self.tabs.len() > 1 || remote || self.panes.values().any(|p| p.agent.is_some());
         let bar_h = if show_bar { r.cell().1 + r.pad } else { 0 };
         self.bar = show_bar.then_some(Rect { x: 0, y: 0, w, h: bar_h });
         let area = Rect { x: 0, y: bar_h, w, h: h.saturating_sub(bar_h) };
@@ -592,11 +675,19 @@ impl App {
     }
 
     fn bar_text(&self) -> String {
-        match &self.backend {
-            Backend::Remote { target, attached: true, .. } => format!("session {} @ {}", self.opts.session, target.label()),
-            Backend::Remote { .. } => self.status.clone(),
-            Backend::Local => String::new(),
+        let mut parts = Vec::new();
+        for (urgency, what) in [(3, "blocked"), (2, "done"), (1, "working")] {
+            let n = self.panes.values().filter(|p| p.agent_look().is_some_and(|l| l.2 == urgency)).count();
+            if n > 0 {
+                parts.push(format!("{n} {what}"));
+            }
         }
+        match &self.backend {
+            Backend::Remote { target, attached: true, .. } => parts.push(format!("session {} @ {}", self.opts.session, target.label())),
+            Backend::Remote { .. } => parts.push(self.status.clone()),
+            Backend::Local => {}
+        }
+        parts.join("   ")
     }
 
     fn redraw(&mut self) {
@@ -620,8 +711,11 @@ impl App {
                 let title = self.panes.get(&tab.focus).map(|p| p.title.as_str()).filter(|t| !t.is_empty());
                 let title: String = title.unwrap_or("shell").chars().take(20).collect();
                 let text = format!("{} {title}", i + 1);
-                let tw = r.text_width(&text) + r.fonts.cell_w;
-                self.tab_labels.push(TabLabel { rect: Rect { x, y: bar.y, w: tw, h: bar.h }, text, active: i == self.active });
+                let looks = tab.tree.leaves().into_iter().filter_map(|id| self.panes.get(&id)?.agent_look());
+                let dot = looks.filter(|l| l.2 > 0).max_by_key(|l| l.2).map(|l| l.0);
+                let tw = r.text_width(&text) + r.fonts.cell_w * if dot.is_some() { 3 } else { 1 };
+                let rect = Rect { x, y: bar.y, w: tw, h: bar.h };
+                self.tab_labels.push(TabLabel { rect, text, active: i == self.active, dot });
                 x += tw + 1;
             }
         }
@@ -634,7 +728,7 @@ impl App {
                 let p = self.panes.get(&id)?;
                 let copy = p.copy.as_ref().map(|c| CopyView { cursor: c.cursor, search: &c.search, status: c.status() });
                 let focused = self.focused && id == focus;
-                Some(PaneView { term: &p.term, rect, selection: p.selection.as_ref(), focused, copy })
+                Some(PaneView { term: &p.term, rect, selection: p.selection.as_ref(), focused, copy, agent: agent_badge(p.agent.as_ref(), p.seen) })
             })
             .collect();
         let outline = if self.rects.len() > 1 { self.rects.iter().find(|(id, _)| *id == focus).map(|(_, r)| *r) } else { None };
@@ -760,6 +854,9 @@ impl App {
             p.selection = None;
         }
         self.write_pane(focus, bytes);
+        if !self.remote() {
+            self.update_agent(focus, |a| Agent::typed(a, bytes));
+        }
         self.request_redraw();
     }
 
@@ -1097,7 +1194,7 @@ impl App {
                     for id in tab.tree.leaves() {
                         if let Some(p) = self.panes.get(&id) {
                             let focused = ti == self.active && id == tab.focus;
-                            out.push_str(&control::list_line(id, Some(ti), &p.term, focused));
+                            out.push_str(&control::list_line(id, Some(ti), &p.term, focused, p.agent.as_ref()));
                         }
                     }
                 }
@@ -1117,6 +1214,9 @@ impl App {
                 let p = self.panes.get(&id).ok_or(control::no_pane(id))?;
                 let bytes = control::input_bytes(&p.term, paste, &data);
                 self.write_pane(id, &bytes);
+                if !self.remote() {
+                    self.update_agent(id, |a| Agent::typed(a, &bytes));
+                }
                 Ok(String::new())
             }
             Request::Read { id, lines } => {
@@ -1125,11 +1225,16 @@ impl App {
             }
             Request::Info { id } => {
                 let p = self.panes.get(&id).ok_or(control::no_pane(id))?;
-                Ok(control::info_text(&p.term, p.last_output))
+                Ok(control::info_text(&p.term, p.last_output, p.agent.as_ref()))
             }
             Request::Focus { id } => {
                 exists(self, id)?;
                 self.focus_pane(id);
+                Ok(String::new())
+            }
+            Request::State { id, state, agent, message } => {
+                exists(self, id)?;
+                self.update_agent(id, |a| Agent::report(a, state, &agent, &message));
                 Ok(String::new())
             }
             Request::Close { id } => {
@@ -1191,6 +1296,14 @@ impl App {
             ConnEvent::Frame(Frame::Output { id, data }) => self.output(id as usize, &data),
             ConnEvent::Frame(Frame::Exited { id }) => self.close_pane(id as usize, el, false),
             ConnEvent::Frame(Frame::Kicked) => self.disconnected("Detached: the session was opened in another window."),
+            ConnEvent::Frame(Frame::Agent { id, state, name, message }) => {
+                let new = AgentState::from_code(state).map(|state| Agent { name, state, message, reports_working: false });
+                self.update_agent(id as usize, |a| {
+                    let changed = *a != new;
+                    *a = new;
+                    changed
+                });
+            }
             ConnEvent::Frame(Frame::Control { req, args }) => {
                 let reply = Request::decode(&args).and_then(|r| self.control(r, el));
                 if let Backend::Remote { conn: Some(c), .. } = &mut self.backend {
@@ -1254,6 +1367,8 @@ impl App {
                 title: String::new(),
                 copy: None,
                 last_output: Instant::now(),
+                agent: None,
+                seen: true,
             };
             self.panes.insert(info.id as usize, pane);
         }

@@ -477,6 +477,15 @@ pub struct PaneView<'a> {
     /// Draw a solid cursor (focused pane in a focused window); otherwise hollow.
     pub focused: bool,
     pub copy: Option<CopyView<'a>>,
+    /// A coding agent's state: a border in its color and a label in the top-right corner.
+    pub agent: Option<AgentBadge>,
+}
+
+pub struct AgentBadge {
+    pub label: String,
+    pub color: u32,
+    /// Draw the border (states that want attention or show activity).
+    pub border: bool,
 }
 
 /// Copy-mode overlay for a pane.
@@ -490,6 +499,8 @@ pub struct TabLabel {
     pub rect: Rect,
     pub text: String,
     pub active: bool,
+    /// Color of a dot before the text: the most urgent agent state in the tab.
+    pub dot: Option<u32>,
 }
 
 /// Window chrome drawn over the panes.
@@ -604,6 +615,26 @@ impl Renderer {
         s.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() * self.fonts.cell_w
     }
 
+    /// An agent's state on its pane: a border in the state's color and a label in the
+    /// top-right corner.
+    fn draw_badge(&mut self, canvas: &mut Canvas, r: Rect, a: &AgentBadge) {
+        let (cw, ch) = self.cell();
+        if a.border {
+            // Within the padding, and wide enough to show inside the focus outline.
+            let t = (self.pad * 3 / 4).max(2);
+            canvas.rect(r.x, r.y, r.w, t, a.color);
+            canvas.rect(r.x, (r.y + r.h).saturating_sub(t), r.w, t, a.color);
+            canvas.rect(r.x, r.y, t, r.h, a.color);
+            canvas.rect((r.x + r.w).saturating_sub(t), r.y, t, r.h, a.color);
+        }
+        let tw = self.text_width(&a.label).min(r.w.saturating_sub(4 * cw));
+        let bw = tw + cw;
+        let (bx, by) = ((r.x + r.w).saturating_sub(bw + self.pad), r.y + self.pad / 2);
+        canvas.rect(bx, by, bw, ch, a.color);
+        let bg = self.theme.bg;
+        self.text(canvas, bx + cw / 2, by, &a.label, bg, tw);
+    }
+
     fn draw_ui(&mut self, canvas: &mut Canvas, w: usize, h: usize, ui: &Ui) {
         let (cw, ch) = self.cell();
         let t = (self.theme.fg, self.theme.bg, self.theme.accent);
@@ -614,7 +645,13 @@ impl Renderer {
                 let r = tab.rect;
                 let (bg, fg) = if tab.active { (t.2, t.1) } else { (0x24283b, 0x9aa5ce) };
                 canvas.rect(r.x, r.y, r.w, r.h, bg);
-                self.text(canvas, r.x + cw / 2, ty, &tab.text, fg, r.w.saturating_sub(cw / 2));
+                let mut x = r.x + cw / 2;
+                if let Some(dot) = tab.dot {
+                    let d = (ch / 3).max(3);
+                    canvas.rect(x + (cw.saturating_sub(d)) / 2, ty + (ch - d) / 2, d, d, dot);
+                    x += 2 * cw;
+                }
+                self.text(canvas, x, ty, &tab.text, fg, (r.x + r.w).saturating_sub(x));
             }
             let rw = self.text_width(right);
             let rx = (bar.x + bar.w).saturating_sub(rw + cw);
@@ -652,6 +689,11 @@ impl Renderer {
         let mut canvas = Canvas { buf, stride: w, clip: frame };
         for d in dividers {
             canvas.rect(d.x, d.y, d.w, d.h, self.theme.divider);
+        }
+        for view in panes {
+            if let Some(a) = &view.agent {
+                self.draw_badge(&mut canvas, view.rect, a);
+            }
         }
         if let Some(r) = outline {
             let c = self.theme.accent;

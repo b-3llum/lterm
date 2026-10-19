@@ -38,6 +38,121 @@ pub enum Request {
     Info { id: usize },
     Focus { id: usize },
     Close { id: usize },
+    /// An agent in pane `id` reports its state (None: no agent there any more).
+    State { id: usize, state: Option<AgentState>, agent: String, message: String },
+}
+
+/// What a coding agent in a pane is doing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgentState {
+    /// Generating, running tools.
+    Working,
+    /// Waiting for you: a permission prompt, a question.
+    Blocked,
+    /// Finished its turn.
+    Done,
+    /// Started, or done and looked at.
+    Idle,
+}
+
+impl AgentState {
+    pub fn parse(s: &str) -> Option<AgentState> {
+        Some(match s {
+            "working" => AgentState::Working,
+            "blocked" => AgentState::Blocked,
+            "done" => AgentState::Done,
+            "idle" => AgentState::Idle,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AgentState::Working => "working",
+            AgentState::Blocked => "blocked",
+            AgentState::Done => "done",
+            AgentState::Idle => "idle",
+        }
+    }
+
+    /// Wire code: 0 is "no agent". Sent by session servers (Unix only).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub fn code(state: Option<AgentState>) -> u32 {
+        match state {
+            None => 0,
+            Some(AgentState::Working) => 1,
+            Some(AgentState::Blocked) => 2,
+            Some(AgentState::Done) => 3,
+            Some(AgentState::Idle) => 4,
+        }
+    }
+
+    pub fn from_code(c: u32) -> Option<AgentState> {
+        [AgentState::Working, AgentState::Blocked, AgentState::Done, AgentState::Idle].get((c as usize).wrapping_sub(1)).copied()
+    }
+}
+
+/// A coding agent running in a pane.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Agent {
+    pub name: String,
+    pub state: AgentState,
+    /// What it said last (a notification, e.g. "Claude needs your permission").
+    pub message: String,
+    /// It reports `working` itself (hooks), so typing into it doesn't have to imply it.
+    pub reports_working: bool,
+}
+
+impl Agent {
+    /// Apply a `lterm pane state` report. Returns whether anything changed.
+    pub fn report(slot: &mut Option<Agent>, state: Option<AgentState>, name: &str, message: &str) -> bool {
+        let old = slot.clone();
+        match state {
+            None => *slot = None,
+            Some(state) => {
+                let a = slot.get_or_insert_with(|| Agent {
+                    name: String::new(),
+                    state,
+                    message: String::new(),
+                    reports_working: false,
+                });
+                if !name.is_empty() {
+                    a.name = name.to_string();
+                } else if a.name.is_empty() {
+                    a.name = "agent".into();
+                }
+                a.state = state;
+                a.message = message.to_string();
+                a.reports_working |= state == AgentState::Working;
+            }
+        }
+        *slot != old
+    }
+
+    /// A terminal notification (OSC 9/777/99) from the pane: the program wants attention.
+    /// It marks the pane blocked unless its agent already said it's done.
+    pub fn notified(slot: &mut Option<Agent>, message: &str) -> bool {
+        match slot {
+            Some(a) if matches!(a.state, AgentState::Done | AgentState::Idle) => false,
+            _ => {
+                let name = slot.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+                Agent::report(slot, Some(AgentState::Blocked), &name, message)
+            }
+        }
+    }
+
+    /// Input typed into the pane. Pressing Enter in an agent that doesn't report its own
+    /// progress (e.g. Codex, which only says when it's done) starts a new turn.
+    pub fn typed(slot: &mut Option<Agent>, data: &[u8]) -> bool {
+        match slot {
+            Some(a) if !a.reports_working && a.state != AgentState::Working && data.contains(&b'\r') => {
+                a.state = AgentState::Working;
+                a.message.clear();
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Request {
@@ -63,6 +178,10 @@ impl Request {
             Request::Info { id } => vec!["info".into(), id.to_string()],
             Request::Focus { id } => vec!["focus".into(), id.to_string()],
             Request::Close { id } => vec!["close".into(), id.to_string()],
+            Request::State { id, state, agent, message } => {
+                let s = state.map_or("none", |s| s.name());
+                vec!["state".into(), id.to_string(), s.into(), agent.clone(), message.clone()]
+            }
         };
         w.shrink_to_fit();
         w
@@ -89,6 +208,15 @@ impl Request {
             Some("info") => Request::Info { id: num(1)? },
             Some("focus") => Request::Focus { id: num(1)? },
             Some("close") => Request::Close { id: num(1)? },
+            Some("state") => Request::State {
+                id: num(1)?,
+                state: match text(2)?.as_str() {
+                    "none" => None,
+                    s => Some(AgentState::parse(s).ok_or_else(bad)?),
+                },
+                agent: text(3)?,
+                message: text(4)?,
+            },
             _ => return Err(bad()),
         })
     }
@@ -101,13 +229,14 @@ pub fn no_pane(id: usize) -> String {
 }
 
 /// One line of `lterm pane list`.
-pub fn list_line(id: usize, tab: Option<usize>, term: &Term, focused: bool) -> String {
+pub fn list_line(id: usize, tab: Option<usize>, term: &Term, focused: bool, agent: Option<&Agent>) -> String {
     let tab = tab.map_or("-".to_string(), |t| (t + 1).to_string());
     let mark = if focused { "*" } else { "-" };
-    format!("{id}\t{tab}\t{}x{}\t{mark}\t{}\n", term.cols, term.rows, term.current_title())
+    let agent = agent.map_or("-".to_string(), |a| format!("{}:{}", a.name, a.state.name()));
+    format!("{id}\t{tab}\t{}x{}\t{mark}\t{agent}\t{}\n", term.cols, term.rows, term.current_title())
 }
 
-pub const LIST_HEADER: &str = "pane\ttab\tsize\tfocus\ttitle\n";
+pub const LIST_HEADER: &str = "pane\ttab\tsize\tfocus\tagent\ttitle\n";
 
 /// The last `lines` lines of a pane's text (0: a screenful), ending at the last
 /// non-blank line so an idle prompt halfway down the screen isn't followed by blanks.
@@ -124,8 +253,13 @@ pub fn read_text(term: &Term, lines: usize) -> String {
     text
 }
 
-pub fn info_text(term: &Term, last_output: Instant) -> String {
-    format!("idle_ms {}\nsize {}x{}\ntitle {}\n", last_output.elapsed().as_millis(), term.cols, term.rows, term.current_title())
+pub fn info_text(term: &Term, last_output: Instant, agent: Option<&Agent>) -> String {
+    let mut s = format!("idle_ms {}\nsize {}x{}\ntitle {}\n", last_output.elapsed().as_millis(), term.cols, term.rows, term.current_title());
+    match agent {
+        Some(a) => s.push_str(&format!("agent {}\nstate {}\nmessage {}\n", a.name, a.state.name(), a.message)),
+        None => s.push_str("agent -\nstate -\n"),
+    }
+    s
 }
 
 /// Bytes to write for a Send request to a pane showing `term`.
@@ -274,12 +408,20 @@ USAGE:
                                              down left right home end pgup pgdn delete
                                              shift-tab ctrl-a..ctrl-z, or one character
     lterm pane read ID [-l N]                Print a pane's last N lines [default: a screen]
+    lterm pane info ID                       Agent, state, message, size, ms since output
     lterm pane wait ID [CONDITION] [--timeout SECS]
         --idle SECS       No output for SECS seconds [default: 3]
         --text TEXT       TEXT appears on the screen
         --exit            The pane has closed
+        --state LIST      The pane's agent reports one of these states (e.g. done,blocked)
     lterm pane focus ID                      Focus a pane (switching tabs if needed)
     lterm pane close ID                      Close a pane and end its program
+    lterm pane state STATE [OPTIONS]         Report what the agent in this pane is doing:
+                                             working, blocked, done, idle, or none (gone).
+        -a, --agent NAME  Agent name shown on the pane (e.g. claude)
+        -m, --message T   What it needs (shown on the pane)
+        -t, --pane ID     Another pane [default: this one]
+                          `lterm integration install claude` sets this up for Claude Code.
 
     Works from any program started inside lterm (it uses $LTERM_SOCKET, $LTERM_TOKEN,
     $LTERM_PANE). Exit status: 0 on success, 1 on errors, 2 if `wait` timed out.
@@ -455,12 +597,44 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "wait" => wait(&rest),
+        "info" => {
+            print(&call(&Request::Info { id: pane_id(rest.first())? })?);
+            Ok(ExitCode::SUCCESS)
+        }
         "focus" => {
             call(&Request::Focus { id: pane_id(rest.first())? })?;
             Ok(ExitCode::SUCCESS)
         }
         "close" | "kill" => {
             call(&Request::Close { id: pane_id(rest.first())? })?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "state" => {
+            let (mut state, mut agent, mut message, mut id) = (None, String::new(), String::new(), own_pane());
+            let mut it = rest.into_iter();
+            while let Some(a) = it.next() {
+                let mut value = |what: &str| it.next().ok_or(format!("{what} needs a value"));
+                match a.as_str() {
+                    "-a" | "--agent" => agent = value(&a)?,
+                    "-m" | "--message" => message = value(&a)?,
+                    "-t" | "--pane" => id = Some(pane_id(Some(&value(&a)?))?),
+                    // Codex's `notify` appends a JSON description of the event.
+                    _ if a.starts_with('{') => {}
+                    _ if state.is_none() => state = Some(a),
+                    _ => return Err(format!("unexpected '{a}'")),
+                }
+            }
+            let state = state.ok_or("missing state (working, blocked, done, idle or none)")?;
+            let state = match state.as_str() {
+                "none" => None,
+                s => Some(AgentState::parse(s).ok_or(format!("unknown state '{s}' (working, blocked, done, idle or none)"))?),
+            };
+            // Agent hooks run this everywhere; outside lterm there is nothing to tell.
+            if std::env::var_os("LTERM_SOCKET").is_none() {
+                return Ok(ExitCode::SUCCESS);
+            }
+            let id = id.ok_or("no pane: use --pane ID")?;
+            call(&Request::State { id, state, agent, message })?;
             Ok(ExitCode::SUCCESS)
         }
         _ => Err(format!("unknown command '{sub}' (see lterm pane --help)")),
@@ -471,6 +645,7 @@ enum Until {
     Idle(Duration),
     Text(String),
     Exit,
+    State(Vec<AgentState>),
 }
 
 fn wait(args: &[String]) -> Result<ExitCode, String> {
@@ -487,6 +662,14 @@ fn wait(args: &[String]) -> Result<ExitCode, String> {
             "--idle" => until = Until::Idle(secs(it.next(), a)?),
             "--text" => until = Until::Text(it.next().ok_or("--text needs a value")?.clone()),
             "--exit" => until = Until::Exit,
+            "--state" => {
+                let v = it.next().ok_or("--state needs a value")?;
+                let states = v
+                    .split(',')
+                    .map(|s| AgentState::parse(s.trim()).ok_or(format!("unknown state '{s}'")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                until = Until::State(states);
+            }
             "--timeout" => timeout = Some(secs(it.next(), a)?),
             _ if id.is_none() => id = Some(a.parse::<usize>().map_err(|_| format!("invalid pane id '{a}'"))?),
             _ => return Err(format!("unexpected '{a}'")),
@@ -508,6 +691,11 @@ fn wait(args: &[String]) -> Result<ExitCode, String> {
             Until::Text(t) => {
                 info?;
                 call(&Request::Read { id, lines: 0 })?.contains(t.as_str())
+            }
+            Until::State(states) => {
+                let info = info?;
+                let state = info.lines().find_map(|l| l.strip_prefix("state ")).and_then(AgentState::parse);
+                state.is_some_and(|s| states.contains(&s))
             }
         };
         if done {
@@ -537,11 +725,50 @@ mod tests {
             Request::Info { id: 7 },
             Request::Focus { id: 1 },
             Request::Close { id: 1 },
+            Request::State { id: 3, state: Some(AgentState::Blocked), agent: "claude".into(), message: "needs you".into() },
+            Request::State { id: 3, state: None, agent: String::new(), message: String::new() },
         ];
         for r in reqs {
             assert_eq!(Request::decode(&r.encode()).unwrap(), r);
         }
         assert!(Request::decode(&["read".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn agent_states() {
+        for s in [None, Some(AgentState::Working), Some(AgentState::Blocked), Some(AgentState::Done), Some(AgentState::Idle)] {
+            assert_eq!(AgentState::from_code(AgentState::code(s)), s);
+        }
+        let mut a = None;
+        // A notification from a plain program marks it as wanting attention.
+        assert!(Agent::notified(&mut a, "build finished"));
+        assert_eq!(a.as_ref().map(|a| (a.name.as_str(), a.state)), Some(("agent", AgentState::Blocked)));
+        // Hooks name it; a finished agent isn't "blocked" by its idle reminder.
+        assert!(Agent::report(&mut a, Some(AgentState::Done), "claude", ""));
+        assert!(!Agent::notified(&mut a, "Claude is waiting for your input"));
+        assert!(!Agent::report(&mut a, Some(AgentState::Done), "", ""));
+        // Enter starts a turn only for agents that don't say so themselves.
+        assert!(Agent::typed(&mut a, b"next task\r"));
+        assert!(Agent::report(&mut a, Some(AgentState::Working), "", ""));
+        Agent::report(&mut a, Some(AgentState::Done), "", "");
+        assert!(!Agent::typed(&mut a, b"\r"));
+        assert_eq!(a.as_ref().unwrap().name, "claude");
+        assert!(Agent::report(&mut a, None, "", ""));
+        assert!(a.is_none() && !Agent::typed(&mut a, b"\r"));
+    }
+
+    #[test]
+    fn notifications() {
+        let mut t = Term::new(20, 5, 100);
+        let mut p = vte::Parser::new();
+        t.feed(&mut p, b"\x1b]9;4;3;50\x07");
+        assert_eq!(t.notification.take(), None); // a progress bar
+        t.feed(&mut p, b"\x1b]9;Claude needs your permission\x07");
+        assert_eq!(t.notification.take().as_deref(), Some("Claude needs your permission"));
+        t.feed(&mut p, b"\x1b]777;notify;Codex;Turn complete\x1b\\");
+        assert_eq!(t.notification.take().as_deref(), Some("Turn complete"));
+        t.feed(&mut p, b"\x1b]99;i=1:d=0;Done\x1b\\");
+        assert_eq!(t.notification.take().as_deref(), Some("Done"));
     }
 
     #[test]

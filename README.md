@@ -7,7 +7,8 @@
 
 # lterm
 
-A small, fast terminal for Windows and Linux with splits, tabs, tmux-style sessions and inline images.
+A small, fast terminal for Windows and Linux with splits, tabs, tmux-style sessions, inline images,
+and panes that show what your coding agents are doing.
 
 ![A persistent SSH session split into four panes: neofetch, rendered docs, vim and htop](screenshots/ssh-splitscreens.png)
 
@@ -52,22 +53,51 @@ lterm --attach user@server     # 2. connect. Split and add tabs freely, with no 
 - **Several sessions:** add `-s NAME` (for example `-s logs`). On the server, `lterm ls` lists them and `lterm kill NAME` ends one.
 - **On Windows,** `lterm --attach wsl` does the same with shells inside WSL.
 
+### Run coding agents side by side
+
+![Four panes: a lead shell listing agents, and Claude Code and Codex panes marked working, blocked and done](screenshots/agents.png)
+
+lterm shows what each coding agent is doing, so you can run several at once and see which one needs you:
+
+| Pane | Means |
+|---|---|
+| Yellow border, `working` | The agent is generating or running tools. |
+| Red border, with what it's asking | It's blocked on you: a permission prompt or a question. |
+| Green border, `done` | It finished its turn. The border fades once you've looked at the pane. |
+
+Tabs get a dot in the color of their most urgent agent, the tab bar counts agents by state, and the
+window flashes in the taskbar when an agent finishes or gets blocked while you're elsewhere.
+
+Turn it on once per agent (restart the agent afterwards):
+
+```
+lterm integration install claude   # Claude Code: hooks in ~/.claude/settings.json (backup kept)
+lterm integration install codex    # Codex: notify in ~/.codex/config.toml
+lterm integration                  # show what's installed; `uninstall` removes it
+```
+
+Any other tool can report its own state with `lterm pane state working|blocked|done|idle|none --agent NAME`.
+Desktop notifications from programs (OSC 9, 777 and 99) also mark a pane as needing you.
+
 ### Let agents and scripts drive panes
 
 Programs running inside lterm (coding agents such as Claude Code or Codex, scripts) can open
-panes, type into them, read them and wait for them with `lterm pane`:
+panes, type into them, read them and wait for them with `lterm pane`. A lead agent can start
+helpers in splits and wait for them to finish:
 
 ```
 id=$(lterm pane split --run "claude 'fix the failing auth tests'")   # new pane, prints its id
-lterm pane wait $id --idle 5          # until it has printed nothing for 5 s
+lterm pane wait $id --state done,blocked    # until it finishes or needs someone
+lterm pane wait $id --idle 5          # or: until it has printed nothing for 5 s
 lterm pane read $id --lines 40        # its last 40 lines of text
 lterm pane send $id "also run the linter"     # type a line and press Enter
 lterm pane keys $id esc               # or press keys: enter, up, ctrl-c, ...
-lterm pane list                       # every pane: id, tab, size, focus, title
+lterm pane list                       # every pane: id, tab, size, focus, agent state, title
 lterm pane close $id
 ```
 
-It works in plain windows and in sessions (`--attach`), including while no window is attached.
+It works in plain windows and in sessions (`--attach`), including while no window is attached;
+agents keep reporting while you're detached and the window shows their state when you come back.
 `lterm pane --help` lists every option.
 
 ## Shortcuts
@@ -107,6 +137,10 @@ Press **Ctrl+Space**, let go, then press a key. **F1** shows every shortcut in t
 
 - **SSH:** password and host prompts appear in a small window, and nothing is saved.
   Use `LTERM_SSH="ssh -p 2222"` for custom ssh options.
+- **Updating:** run `lterm install` again so the hooks find the new version, and `lterm push` to
+  servers you attach to (a window and its session server must be the same version).
+- **Agent state without hooks:** Codex only reports finished turns, so pressing Enter in its pane
+  counts as `working`. Programs lterm knows nothing about show no state.
 - **Windows images** need `conpty.dll` and `OpenConsole.exe` next to `lterm.exe`
   (included in the Windows zip, from Microsoft's MIT-licensed ConPTY package).
 - **Linux build** needs glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+). On older systems, build from source.

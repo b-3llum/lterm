@@ -155,7 +155,7 @@ impl ApplicationHandler for Ask {
                 }
                 let Ok(mut buf) = g.surface.buffer_mut() else { return };
                 let (w, h) = (size.width as usize, size.height as usize);
-                let view = PaneView { term: &term, rect: Rect { x: 0, y: 0, w, h }, selection: None, focused: true, copy: None };
+                let view = PaneView { term: &term, rect: Rect { x: 0, y: 0, w, h }, selection: None, focused: true, copy: None, agent: None };
                 r.draw(&mut buf[..], w, h, &[view], &[], None, &Ui::default());
                 let _ = buf.present();
             }

@@ -190,6 +190,8 @@ pub struct Term {
     /// The last title set, kept for snapshots.
     current_title: String,
     pub bell: bool,
+    /// A desktop notification the program sent (OSC 9/777/99), taken by the front end.
+    pub notification: Option<String>,
     /// Replies to the program (device reports etc.), written back to the pty.
     pub responses: Vec<u8>,
     /// Cell size in pixels, used for image sizing and pixel reports.
@@ -240,6 +242,7 @@ impl Term {
             title: None,
             current_title: String::new(),
             bell: false,
+            notification: None,
             responses: Vec::new(),
             cell_px: (8, 16),
             default_colors: ([0xc0, 0xca, 0xf5], [0x1a, 0x1b, 0x26]),
@@ -328,6 +331,19 @@ impl Term {
     /// The title the program set last (OSC 0/2).
     pub fn current_title(&self) -> &str {
         &self.current_title
+    }
+
+    fn notify(&mut self, parts: &[&[u8]]) {
+        let text: String = parts
+            .iter()
+            .map(|p| String::from_utf8_lossy(p))
+            .collect::<Vec<_>>()
+            .join(";")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect();
+        self.notification = Some(text);
     }
 
     pub fn cursor_pos(&self) -> (usize, usize) {
@@ -1347,6 +1363,14 @@ impl Perform for Term {
                     c[0], c[1], c[2]
                 ));
             }
+            // Desktop notifications: OSC 9;text (iTerm2; 9;4;... is a progress bar, not
+            // a notification), OSC 777;notify;title;body, OSC 99;metadata;text (kitty).
+            b"9" if params.get(1).is_some_and(|p| *p != b"4") => self.notify(&params[1..]),
+            b"777" if params.get(1) == Some(&&b"notify"[..]) => {
+                let body = params.get(3).filter(|b| !b.is_empty()).or(params.get(2));
+                self.notify(body.map(std::slice::from_ref).unwrap_or(&[]));
+            }
+            b"99" if params.len() > 2 => self.notify(&params[2..]),
             _ => {}
         }
     }

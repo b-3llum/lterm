@@ -11,7 +11,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Written by the proxy before the first frame, so stray output from a remote login
 /// shell (motd, profile scripts) can be skipped.
 const MAGIC: &[u8] = b"\0LTERM-SESSION\0";
@@ -41,6 +41,8 @@ pub enum Frame {
     /// A `lterm pane` request the server passes to the window (it changes the layout).
     Control { req: u32, args: Vec<String> },
     ControlReply { req: u32, ok: bool, text: String },
+    /// The server tells the window what the agent in a pane is doing (state 0: none).
+    Agent { id: u32, state: u32, name: String, message: String },
 }
 
 fn put16(b: &mut Vec<u8>, v: u16) {
@@ -156,6 +158,13 @@ impl Frame {
                 put_bytes(&mut p, text.as_bytes());
                 14
             }
+            Frame::Agent { id, state, name, message } => {
+                put32(&mut p, *id);
+                put32(&mut p, *state);
+                put_bytes(&mut p, name.as_bytes());
+                put_bytes(&mut p, message.as_bytes());
+                15
+            }
         };
         let mut out = Vec::with_capacity(5 + p.len());
         out.push(tag);
@@ -215,6 +224,7 @@ impl Frame {
                 Frame::Control { req, args }
             }
             14 => Frame::ControlReply { req: d.u32()?, ok: d.u32()? != 0, text: d.string()? },
+            15 => Frame::Agent { id: d.u32()?, state: d.u32()?, name: d.string()?, message: d.string()? },
             t => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown frame type {t}"))),
         })
     }
@@ -416,7 +426,7 @@ mod server {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use crate::control::{self, Endpoint, Reply, Request};
+    use crate::control::{self, Agent, AgentState, Endpoint, Reply, Request};
     use crate::layout::{self, Dir, Node, Tab};
     use crate::pty::{self, Pty, PtyMsg};
     use crate::term::Term;
@@ -577,6 +587,13 @@ mod server {
         parser: vte::Parser,
         pty: Pty,
         last_output: Instant,
+        agent: Option<Agent>,
+    }
+
+    fn agent_frame(id: u32, agent: &Option<Agent>) -> Frame {
+        let state = AgentState::code(agent.as_ref().map(|a| a.state));
+        let (name, message) = agent.as_ref().map_or((String::new(), String::new()), |a| (a.name.clone(), a.message.clone()));
+        Frame::Agent { id, state, name, message }
     }
 
     type Client = Option<(u64, UnixStream)>;
@@ -607,7 +624,7 @@ mod server {
             let pty = pty::spawn(command, cols, rows, cell, &env, move |m| {
                 let _ = tx.send(Msg::Pty(id, m));
             })?;
-            self.panes.insert(id, Pane { term, parser: vte::Parser::new(), pty, last_output: Instant::now() });
+            self.panes.insert(id, Pane { term, parser: vte::Parser::new(), pty, last_output: Instant::now(), agent: None });
             Ok(())
         }
 
@@ -643,13 +660,15 @@ mod server {
                         for id in tab.tree.leaves() {
                             listed.insert(id as u32);
                             let focused = ti == active && id == tab.focus;
-                            out.push_str(&control::list_line(id, Some(ti), &self.panes[&(id as u32)].term, focused));
+                            let p = &self.panes[&(id as u32)];
+                            out.push_str(&control::list_line(id, Some(ti), &p.term, focused, p.agent.as_ref()));
                         }
                     }
                     let mut rest: Vec<u32> = self.panes.keys().copied().filter(|id| !listed.contains(id)).collect();
                     rest.sort();
                     for id in rest {
-                        out.push_str(&control::list_line(id as usize, None, &self.panes[&id].term, false));
+                        let p = &self.panes[&id];
+                        out.push_str(&control::list_line(id as usize, None, &p.term, false, p.agent.as_ref()));
                     }
                     Ok(out)
                 }
@@ -657,17 +676,27 @@ mod server {
                     let p = self.pane(id)?;
                     let bytes = control::input_bytes(&p.term, paste, &data);
                     p.pty.write(&bytes);
+                    if Agent::typed(&mut p.agent, &bytes) {
+                        send(client, &agent_frame(id as u32, &p.agent));
+                    }
                     Ok(String::new())
                 }
                 Request::Read { id, lines } => Ok(control::read_text(&self.pane(id)?.term, lines)),
                 Request::Info { id } => {
                     let p = self.pane(id)?;
-                    Ok(control::info_text(&p.term, p.last_output))
+                    Ok(control::info_text(&p.term, p.last_output, p.agent.as_ref()))
                 }
                 Request::Close { id } => {
                     self.pane(id)?;
                     self.panes.remove(&(id as u32));
                     send(client, &Frame::Exited { id: id as u32 });
+                    Ok(String::new())
+                }
+                Request::State { id, state, agent, message } => {
+                    let p = self.pane(id)?;
+                    if Agent::report(&mut p.agent, state, &agent, &message) {
+                        send(client, &agent_frame(id as u32, &p.agent));
+                    }
                     Ok(String::new())
                 }
                 Request::Focus { id } => {
@@ -834,8 +863,11 @@ mod server {
                         .collect();
                     send(&mut client, &Frame::Welcome { version: VERSION, layout: sh.layout.clone(), panes: info });
                     for id in ids {
-                        let data = sh.panes[&id].term.snapshot(5000);
-                        send(&mut client, &Frame::Output { id, data });
+                        let p = &sh.panes[&id];
+                        send(&mut client, &Frame::Output { id, data: p.term.snapshot(5000) });
+                        if p.agent.is_some() {
+                            send(&mut client, &agent_frame(id, &p.agent));
+                        }
                     }
                 }
                 Msg::Frame(_, Frame::Shutdown) => break,
@@ -861,6 +893,9 @@ mod server {
                         Frame::Input { id, data } => {
                             if let Some(p) = sh.panes.get_mut(&id) {
                                 p.pty.write(&data);
+                                if Agent::typed(&mut p.agent, &data) {
+                                    send(&mut client, &agent_frame(id, &p.agent));
+                                }
                             }
                         }
                         Frame::Resize { id, cols, rows, cw, ch } => {
@@ -919,7 +954,11 @@ mod server {
                     p.last_output = Instant::now();
                     let replies = std::mem::take(&mut p.term.responses);
                     p.pty.write(&replies);
+                    let notified = p.term.notification.take().is_some_and(|m| Agent::notified(&mut p.agent, &m));
                     send(&mut client, &Frame::Output { id, data });
+                    if notified {
+                        send(&mut client, &agent_frame(id, &p.agent));
+                    }
                 }
                 Msg::Pty(id, PtyMsg::Exit) => {
                     if sh.panes.remove(&id).is_some() {
@@ -959,6 +998,7 @@ mod tests {
             Frame::Shutdown,
             Frame::Control { req: 5, args: vec!["split".into(), String::new(), "down".into()] },
             Frame::ControlReply { req: 5, ok: true, text: "8\n".into() },
+            Frame::Agent { id: 2, state: 2, name: "claude".into(), message: "needs you".into() },
         ];
         let mut buf = b"Welcome to Ubuntu!\n".to_vec();
         buf.extend_from_slice(MAGIC);
