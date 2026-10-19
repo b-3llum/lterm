@@ -83,6 +83,9 @@ lterm integration                  # show what's installed; `uninstall` removes 
 ```
 
 Codex runs only hooks you've reviewed: after installing, start Codex, type `/hooks` and trust lterm's.
+Start Codex as `codex --no-daemon` in lterm. Codex's shared background server runs the hooks with the
+environment of the pane that first started it, so without the flag every Codex reports to that pane
+(or fails with `no pane N` once it's closed).
 
 Any other tool can report its own state with `lterm pane state working|blocked|done|idle|none --agent NAME`.
 Desktop notifications from programs (OSC 9, 777 and 99) also mark a pane as needing you.

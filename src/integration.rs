@@ -21,7 +21,9 @@ USAGE:
     Claude Code gets hooks in ~/.claude/settings.json (a backup is kept next to it) and a
     skill, lterm-panes, that shows it how to run helper agents in panes. Codex gets hooks in
     ~/.codex/hooks.json (trust them once with /hooks in Codex) and `notify` in config.toml.
-    Restart the agent afterwards.
+    Restart the agent afterwards. Start Codex as `codex --no-daemon`: Codex's shared
+    background server runs the hooks from the pane that started it, so without the flag every
+    Codex reports to that pane.
     Outside lterm the hooks do nothing.
 ";
 
@@ -98,7 +100,8 @@ Exit status: 0 success, 1 error, 2 `wait` timed out. Your own pane id is in `LTE
    which avoids quoting problems in every shell:
    `lterm pane split --run "claude 'Do the task in .lterm-tasks/auth.md, then summarize what you changed.'"`
    Use `--down` or `--pane ID` to arrange panes; tell the user which pane does what.
-   Codex works the same way: `--run "codex 'Do the task in ...'"`.
+   Codex works the same way: `--run "codex --no-daemon 'Do the task in ...'"` (without
+   `--no-daemon`, Codex's shared background server reports its state on the wrong pane).
 3. Wait for it: `lterm pane wait ID --state done,blocked --timeout 1800`. The state comes from
    lterm's hooks for Claude Code and Codex; if `lterm pane list` shows `-` for a running agent, the hooks aren't
    installed, so use `--idle 60` and read the screen instead.
@@ -398,7 +401,7 @@ fn install_codex() -> Result<String, String> {
     // Also the turn-done notify: the Codex app runs it too, and it's what older Codex has.
     let notify = install_codex_notify().unwrap_or_else(|e| format!("Skipped notify: {e}\n"));
     Ok(format!(
-        "Added lterm hooks to {}.\n{notify}\nOne more step: start Codex, type /hooks and trust lterm's hooks (Codex only runs hooks you've\nreviewed, and asks again if they change). Then its panes show working, blocked (needs you) and done.\n",
+        "Added lterm hooks to {}.\n{notify}\nOne more step: start Codex, type /hooks and trust lterm's hooks (Codex only runs hooks you've\nreviewed, and asks again if they change). Then its panes show working, blocked (needs you) and done.\nStart Codex as `codex --no-daemon` in lterm: Codex's shared background server runs the hooks from\nthe pane that started it, so without the flag every Codex reports to that pane.\n",
         path.display()
     ))
 }
