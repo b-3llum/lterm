@@ -1,6 +1,6 @@
 [package]
 name = "lterm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A lightweight cross-platform terminal with splits, tabs, persistent sessions and inline images"
 license = "MIT"

@@ -10,17 +10,47 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
 }
 
+/// Put a copy of `from` at `to`, even while `to` is running.
 fn copy_exe(from: &Path, to: &Path) -> Result<(), String> {
     if same_file(from, to) {
         return Ok(());
     }
-    // Replace via a temp file so a running copy doesn't block the update (on Unix).
-    let tmp = to.with_extension("new");
+    // Replace via a temp file: a running copy doesn't block that on Unix.
+    let mut tmp = to.as_os_str().to_owned();
+    tmp.push(".new");
+    let tmp = PathBuf::from(tmp);
     fs::copy(from, &tmp).map_err(|e| format!("copy to {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, to).map_err(|e| {
+    if fs::rename(&tmp, to).is_ok() {
+        return Ok(());
+    }
+    // On Windows a running program (or a DLL it loaded) can't be overwritten, but it can
+    // be renamed: move it aside (removed by the next install) and put the new one in place.
+    let result = retire(to).and_then(|_| fs::rename(&tmp, to).map_err(|e| e.to_string()));
+    result.map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("replace {}: {e} (close lterm and try again)", to.display())
     })
+}
+
+/// Remove `p`, or if it's in use, rename it to `p.old-N` so its name is free.
+fn retire(p: &Path) -> Result<(), String> {
+    if !p.exists() || fs::remove_file(p).is_ok() {
+        return Ok(());
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let mut old = p.as_os_str().to_owned();
+    old.push(format!(".old-{stamp}"));
+    fs::rename(p, &old).map_err(|e| e.to_string())
+}
+
+/// Delete files moved aside by earlier installs (those still running stay until next time).
+#[cfg(windows)]
+fn clean_retired(dir: &Path) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().contains(".old-") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -153,6 +183,7 @@ const SHORTCUT: &str = "$s = (New-Object -ComObject WScript.Shell).CreateShortcu
 fn install() -> Result<(), String> {
     let (dir, lnk) = dirs()?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    clean_retired(&dir);
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let target = dir.join("lterm.exe");
     copy_exe(&exe, &target)?;
@@ -162,23 +193,19 @@ fn install() -> Result<(), String> {
     for f in ["conpty.dll", "OpenConsole.exe", "THIRD_PARTY.txt"] {
         let from = src.join(f);
         if from.is_file() {
-            if !same_file(&from, &dir.join(f)) {
-                fs::copy(&from, dir.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
-            }
+            // Open lterm windows hold these too.
+            copy_exe(&from, &dir.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
         } else if f != "THIRD_PARTY.txt" && !dir.join(f).is_file() {
             have_conpty = false;
         }
     }
     // Keep the Linux build alongside, for `lterm push` to servers.
     if let Ok(linux) = crate::push::find_linux_build() {
-        let dest = dir.join("lterm-linux-x86_64");
-        if !same_file(&linux, &dest) {
-            fs::copy(&linux, &dest).map_err(|e| format!("copy Linux build: {e}"))?;
-        }
+        copy_exe(&linux, &dir.join("lterm-linux-x86_64")).map_err(|e| format!("copy Linux build: {e}"))?;
         println!("included the Linux build, for `lterm push user@server`");
     }
     let alias = dir.join("mdterm.exe");
-    let _ = fs::remove_file(&alias);
+    retire(&alias)?;
     if fs::hard_link(&target, &alias).is_err() {
         fs::copy(&target, &alias).map_err(|e| e.to_string())?;
     }
@@ -198,6 +225,7 @@ fn install() -> Result<(), String> {
 #[cfg(windows)]
 fn remove() -> Result<(), String> {
     let (dir, lnk) = dirs()?;
+    clean_retired(&dir);
     powershell(REMOVE_PATH, &[&dir.to_string_lossy()])?;
     println!("removed {} from your PATH", dir.display());
     if lnk.is_file() {
