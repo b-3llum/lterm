@@ -78,9 +78,11 @@ Turn it on once per agent (restart the agent afterwards):
 ```
 lterm integration install claude   # Claude Code: hooks in ~/.claude/settings.json (backup kept),
                                    #   plus the lterm-panes skill (see below)
-lterm integration install codex    # Codex: notify in ~/.codex/config.toml
+lterm integration install codex    # Codex: hooks in ~/.codex/hooks.json, notify in config.toml
 lterm integration                  # show what's installed; `uninstall` removes it
 ```
+
+Codex runs only hooks you've reviewed: after installing, start Codex, type `/hooks` and trust lterm's.
 
 Any other tool can report its own state with `lterm pane state working|blocked|done|idle|none --agent NAME`.
 Desktop notifications from programs (OSC 9, 777 and 99) also mark a pane as needing you.
@@ -152,8 +154,9 @@ Press **Ctrl+Space**, let go, then press a key. **F1** shows every shortcut in t
   Use `LTERM_SSH="ssh -p 2222"` for custom ssh options.
 - **Updating:** run `lterm install` again so the hooks find the new version, and `lterm push` to
   servers you attach to (a window and its session server must be the same version).
-- **Agent state without hooks:** Codex only reports finished turns, so pressing Enter in its pane
-  counts as `working`. Programs lterm knows nothing about show no state.
+- **Agent state without hooks:** with only `notify` (older Codex, or hooks not trusted yet), Codex
+  reports finished turns, so pressing Enter in its pane counts as `working`. Programs lterm knows
+  nothing about show no state.
 - **Windows images** need `conpty.dll` and `OpenConsole.exe` next to `lterm.exe`
   (included in the Windows zip, from Microsoft's MIT-licensed ConPTY package).
 - **Linux build** needs glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+). On older systems, build from source.

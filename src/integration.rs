@@ -1,8 +1,9 @@
 //! `lterm integration install|uninstall AGENT`: make a coding agent report what it's
 //! doing (`lterm pane state ...`), so its pane shows working / blocked / done.
 //!
-//! Claude Code: hooks in ~/.claude/settings.json. Codex: `notify` in ~/.codex/config.toml
-//! (Codex only reports finished turns; pressing Enter in its pane counts as "working").
+//! Claude Code: hooks in ~/.claude/settings.json, plus a skill. Codex: hooks in
+//! ~/.codex/hooks.json, plus `notify` in ~/.codex/config.toml for turn ends (older Codex
+//! has only that; then pressing Enter in its pane counts as "working").
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,21 +19,37 @@ USAGE:
     lterm integration uninstall AGENT
 
     Claude Code gets hooks in ~/.claude/settings.json (a backup is kept next to it) and a
-    skill, lterm-panes, that shows it how to run helper agents in panes;
-    Codex gets `notify` in ~/.codex/config.toml. Restart the agent afterwards.
+    skill, lterm-panes, that shows it how to run helper agents in panes. Codex gets hooks in
+    ~/.codex/hooks.json (trust them once with /hooks in Codex) and `notify` in config.toml.
+    Restart the agent afterwards.
     Outside lterm the hooks do nothing.
 ";
 
-/// (Claude Code hook event, matcher, state it reports)
-const CLAUDE_HOOKS: [(&str, Option<&str>, &str); 7] = [
-    ("SessionStart", None, "idle"),
-    ("UserPromptSubmit", None, "working"),
+/// (hook event, matcher, state it reports, timeout in seconds)
+type Hooks = [(&'static str, Option<&'static str>, &'static str, u32)];
+
+const CLAUDE_HOOKS: &Hooks = &[
+    ("SessionStart", None, "idle", 10),
+    ("UserPromptSubmit", None, "working", 10),
     // After a tool ran, including one you just approved.
-    ("PostToolUse", None, "working"),
-    ("Notification", Some("permission_prompt|elicitation_dialog"), "blocked"),
-    ("Stop", None, "done"),
-    ("StopFailure", None, "done"),
-    ("SessionEnd", None, "none"),
+    ("PostToolUse", None, "working", 10),
+    ("Notification", Some("permission_prompt|elicitation_dialog"), "blocked", 10),
+    ("Stop", None, "done", 10),
+    ("StopFailure", None, "done", 10),
+    ("SessionEnd", None, "none", 10),
+];
+
+/// Codex's hooks (~/.codex/hooks.json) use the same format. A PermissionRequest hook that
+/// prints nothing leaves the decision to the normal approval prompt. SessionEnd and
+/// Interrupt hooks may take at most 3 seconds.
+const CODEX_HOOKS: &Hooks = &[
+    ("SessionStart", None, "idle", 10),
+    ("UserPromptSubmit", None, "working", 10),
+    ("PostToolUse", None, "working", 10),
+    ("PermissionRequest", None, "blocked", 10),
+    ("Stop", None, "done", 10),
+    ("Interrupt", None, "idle", 3),
+    ("SessionEnd", None, "none", 3),
 ];
 
 /// Marks the skill as lterm's, so uninstall only removes its own.
@@ -81,8 +98,9 @@ Exit status: 0 success, 1 error, 2 `wait` timed out. Your own pane id is in `LTE
    which avoids quoting problems in every shell:
    `lterm pane split --run "claude 'Do the task in .lterm-tasks/auth.md, then summarize what you changed.'"`
    Use `--down` or `--pane ID` to arrange panes; tell the user which pane does what.
+   Codex works the same way: `--run "codex 'Do the task in ...'"`.
 3. Wait for it: `lterm pane wait ID --state done,blocked --timeout 1800`. The state comes from
-   lterm's Claude Code hooks; if `lterm pane list` shows `-` for a running agent, the hooks aren't
+   lterm's hooks for Claude Code and Codex; if `lterm pane list` shows `-` for a running agent, the hooks aren't
    installed, so use `--idle 60` and read the screen instead.
 4. Read the result with `lterm pane read ID --lines 120`, check the work (diffs, tests), and send
    follow-ups with `lterm pane send ID "..."`.
@@ -176,12 +194,19 @@ fn uninstall_skill() -> Result<bool, String> {
     Ok(true)
 }
 
+fn codex_dir() -> Result<PathBuf, String> {
+    match std::env::var_os("CODEX_HOME") {
+        Some(d) => Ok(PathBuf::from(d)),
+        None => Ok(home()?.join(".codex")),
+    }
+}
+
 fn codex_config() -> Result<PathBuf, String> {
-    let dir = match std::env::var_os("CODEX_HOME") {
-        Some(d) => PathBuf::from(d),
-        None => home()?.join(".codex"),
-    };
-    Ok(dir.join("config.toml"))
+    Ok(codex_dir()?.join("config.toml"))
+}
+
+fn codex_hooks() -> Result<PathBuf, String> {
+    Ok(codex_dir()?.join("hooks.json"))
 }
 
 /// lterm on PATH (`lterm install` puts it there).
@@ -201,9 +226,9 @@ fn lterm_path() -> Result<String, String> {
     Ok(path.to_string_lossy().replace('\\', "/"))
 }
 
-/// The hook command line. Claude Code runs it in sh, Git Bash or PowerShell, so it must
+/// The hook command line. Agents run it in sh, Git Bash, cmd or PowerShell, so it must
 /// read the same in all of them: no quotes, so no spaces.
-fn hook_command(state: &str) -> Result<String, String> {
+fn hook_command(state: &str, agent: &str) -> Result<String, String> {
     let exe = lterm_path()?;
     let lterm = if on_path().is_some() {
         "lterm".to_string()
@@ -212,15 +237,16 @@ fn hook_command(state: &str) -> Result<String, String> {
     } else {
         exe
     };
-    Ok(format!("{lterm} pane state {state} --agent claude"))
+    Ok(format!("{lterm} pane state {state} --agent {agent}"))
 }
 
-fn is_ours(hook: &Value) -> bool {
-    hook.get("command").and_then(Value::as_str).is_some_and(|c| c.contains(" pane state ") && c.ends_with("--agent claude"))
+fn is_ours(hook: &Value, agent: &str) -> bool {
+    let end = format!("--agent {agent}");
+    hook.get("command").and_then(Value::as_str).is_some_and(|c| c.contains(" pane state ") && c.ends_with(&end))
 }
 
 /// Remove lterm's hooks, and any groups and events left empty. Returns how many it removed.
-fn remove_claude_hooks(root: &mut Map<String, Value>) -> usize {
+fn remove_hooks(root: &mut Map<String, Value>, agent: &str) -> usize {
     let Some(Value::Object(hooks)) = root.get_mut("hooks") else { return 0 };
     let mut removed = 0;
     for groups in hooks.values_mut() {
@@ -228,7 +254,7 @@ fn remove_claude_hooks(root: &mut Map<String, Value>) -> usize {
         for group in groups.iter_mut() {
             if let Some(Value::Array(list)) = group.get_mut("hooks") {
                 let before = list.len();
-                list.retain(|h| !is_ours(h));
+                list.retain(|h| !is_ours(h, agent));
                 removed += before - list.len();
             }
         }
@@ -241,17 +267,17 @@ fn remove_claude_hooks(root: &mut Map<String, Value>) -> usize {
     removed
 }
 
-fn add_claude_hooks(root: &mut Map<String, Value>) -> Result<(), String> {
+fn add_hooks(root: &mut Map<String, Value>, agent: &str, list: &Hooks) -> Result<(), String> {
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
-    let hooks = hooks.as_object_mut().ok_or("\"hooks\" in settings.json isn't an object")?;
-    for (event, matcher, state) in CLAUDE_HOOKS {
+    let hooks = hooks.as_object_mut().ok_or("\"hooks\" isn't an object")?;
+    for &(event, matcher, state, timeout) in list {
         let mut group = Map::new();
         if let Some(m) = matcher {
             group.insert("matcher".into(), json!(m));
         }
-        group.insert("hooks".into(), json!([{ "type": "command", "command": hook_command(state)?, "timeout": 10 }]));
-        let list = hooks.entry(event).or_insert_with(|| json!([]));
-        list.as_array_mut().ok_or(format!("\"hooks.{event}\" in settings.json isn't a list"))?.push(Value::Object(group));
+        group.insert("hooks".into(), json!([{ "type": "command", "command": hook_command(state, agent)?, "timeout": timeout }]));
+        let groups = hooks.entry(event).or_insert_with(|| json!([]));
+        groups.as_array_mut().ok_or(format!("\"hooks.{event}\" isn't a list"))?.push(Value::Object(group));
     }
     Ok(())
 }
@@ -296,8 +322,8 @@ fn write_json(path: &Path, root: Map<String, Value>) -> Result<(), String> {
 fn install_claude() -> Result<String, String> {
     let path = claude_settings()?;
     let mut root = read_json(&path)?;
-    remove_claude_hooks(&mut root);
-    add_claude_hooks(&mut root)?;
+    remove_hooks(&mut root, "claude");
+    add_hooks(&mut root, "claude", CLAUDE_HOOKS)?;
     write_json(&path, root)?;
     let skill = install_skill()?;
     Ok(format!(
@@ -310,7 +336,7 @@ fn uninstall_claude() -> Result<String, String> {
     let path = claude_settings()?;
     let mut root = read_json(&path)?;
     let skill = if uninstall_skill()? { "Removed the lterm-panes skill.\n" } else { "" };
-    if remove_claude_hooks(&mut root) == 0 {
+    if remove_hooks(&mut root, "claude") == 0 {
         return Ok(format!("No lterm hooks in {}.\n{skill}", path.display()));
     }
     write_json(&path, root)?;
@@ -364,6 +390,20 @@ fn classify(line: &str) -> Notify {
 }
 
 fn install_codex() -> Result<String, String> {
+    let path = codex_hooks()?;
+    let mut root = read_json(&path)?;
+    remove_hooks(&mut root, "codex");
+    add_hooks(&mut root, "codex", CODEX_HOOKS)?;
+    write_json(&path, root)?;
+    // Also the turn-done notify: the Codex app runs it too, and it's what older Codex has.
+    let notify = install_codex_notify().unwrap_or_else(|e| format!("Skipped notify: {e}\n"));
+    Ok(format!(
+        "Added lterm hooks to {}.\n{notify}\nOne more step: start Codex, type /hooks and trust lterm's hooks (Codex only runs hooks you've\nreviewed, and asks again if they change). Then its panes show working, blocked (needs you) and done.\n",
+        path.display()
+    ))
+}
+
+fn install_codex_notify() -> Result<String, String> {
     let path = codex_config()?;
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -382,7 +422,7 @@ fn install_codex() -> Result<String, String> {
                 } else {
                     format!("\nBut {lterm} doesn't exist any more: remove that entry and install again.")
                 };
-                return Ok(format!("Already installed: Codex runs {by}, which then calls lterm ({lterm}).{note}\n"));
+                return Ok(format!("Notify: already set up; Codex runs {by}, which then calls lterm ({lterm}).{note}\n"));
             }
             Notify::Other => {
                 return Err(format!(
@@ -395,10 +435,27 @@ fn install_codex() -> Result<String, String> {
         None => lines.insert(0, line),
     }
     write_file(&path, &(lines.join("\n") + "\n"))?;
-    Ok(format!("Added lterm's notify to {}.\nRestart Codex; its panes now show done when a turn ends.\n", path.display()))
+    Ok(format!("Added lterm's notify (turn done) to {}.\n", path.display()))
 }
 
 fn uninstall_codex() -> Result<String, String> {
+    let path = codex_hooks()?;
+    let mut root = read_json(&path)?;
+    let hooks = if remove_hooks(&mut root, "codex") == 0 {
+        format!("No lterm hooks in {}.\n", path.display())
+    } else {
+        if root.is_empty() {
+            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        } else {
+            write_json(&path, root)?;
+        }
+        format!("Removed lterm hooks from {}.\n", path.display())
+    };
+    let notify = uninstall_codex_notify().unwrap_or_else(|e| format!("Notify: {e}\n"));
+    Ok(hooks + &notify)
+}
+
+fn uninstall_codex_notify() -> Result<String, String> {
     let path = codex_config()?;
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(format!("No {}.\n", path.display())) };
     let lines: Vec<&str> = text.lines().collect();
@@ -418,7 +475,7 @@ fn uninstall_codex() -> Result<String, String> {
 }
 fn status() -> String {
     let claude = claude_settings().ok().map(|p| {
-        let n = read_json(&p).ok().map_or(0, |mut root| remove_claude_hooks(&mut root));
+        let n = read_json(&p).ok().map_or(0, |mut root| remove_hooks(&mut root, "claude"));
         let skill = claude_skill().is_ok_and(|s| std::fs::read_to_string(s).is_ok_and(|t| t.contains(SKILL_MARK)));
         let state = match (n > 0, skill) {
             (true, true) => "installed (hooks and skill)",
@@ -429,13 +486,20 @@ fn status() -> String {
         format!("    claude  {state}  ({})\n", p.display())
     });
     let codex = codex_config().ok().map(|p| {
+        let hooks = codex_hooks().ok().and_then(|h| read_json(&h).ok()).map_or(0, |mut root| remove_hooks(&mut root, "codex"));
         let line = std::fs::read_to_string(&p).ok().and_then(|t| t.lines().find(|l| is_notify(l)).map(classify));
-        let state = match line {
-            Some(Notify::Ours) => "installed".to_string(),
-            Some(Notify::Chained(by, _)) => format!("installed (called by {by})"),
-            _ => "not installed".to_string(),
+        let notify = match line {
+            Some(Notify::Ours) => Some("notify".to_string()),
+            Some(Notify::Chained(by, _)) => Some(format!("notify via {by}")),
+            _ => None,
         };
-        format!("    codex   {state}  ({})\n", p.display())
+        let state = match (hooks > 0, notify) {
+            (true, Some(n)) => format!("installed (hooks and {n})"),
+            (true, None) => "installed (hooks)".to_string(),
+            (false, Some(n)) => format!("installed ({n} only: run install again for hooks)"),
+            (false, None) => "not installed".to_string(),
+        };
+        format!("    codex   {state}  ({})\n", p.parent().unwrap_or(&p).display())
     });
     claude.unwrap_or_default() + &codex.unwrap_or_default()
 }
@@ -450,10 +514,10 @@ mod tests {
             r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"notify-send done"}]}]}}"#,
         )
         .unwrap();
-        add_claude_hooks(&mut root).unwrap();
+        add_hooks(&mut root, "claude", CLAUDE_HOOKS).unwrap();
         // Installing twice doesn't duplicate.
-        remove_claude_hooks(&mut root);
-        add_claude_hooks(&mut root).unwrap();
+        remove_hooks(&mut root, "claude");
+        add_hooks(&mut root, "claude", CLAUDE_HOOKS).unwrap();
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2);
         assert_eq!(stop[0]["hooks"][0]["command"], "notify-send done");
@@ -461,7 +525,11 @@ mod tests {
         assert_eq!(root["hooks"]["Notification"][0]["matcher"], "permission_prompt|elicitation_dialog");
         assert_eq!(root.keys().next().map(String::as_str), Some("model"));
 
-        assert_eq!(remove_claude_hooks(&mut root), CLAUDE_HOOKS.len());
+        // Each agent's hooks are its own.
+        add_hooks(&mut root, "codex", CODEX_HOOKS).unwrap();
+        assert_eq!(remove_hooks(&mut root, "claude"), CLAUDE_HOOKS.len());
+        assert_eq!(root["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        assert_eq!(remove_hooks(&mut root, "codex"), CODEX_HOOKS.len());
         let expected: Value = serde_json::from_str(
             r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"notify-send done"}]}]}}"#,
         )
