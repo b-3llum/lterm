@@ -11,7 +11,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Written by the proxy before the first frame, so stray output from a remote login
 /// shell (motd, profile scripts) can be skipped.
 const MAGIC: &[u8] = b"\0LTERM-SESSION\0";
@@ -38,6 +38,9 @@ pub enum Frame {
     Detach,
     Kicked,
     Shutdown,
+    /// A `lterm pane` request the server passes to the window (it changes the layout).
+    Control { req: u32, args: Vec<String> },
+    ControlReply { req: u32, ok: bool, text: String },
 }
 
 fn put16(b: &mut Vec<u8>, v: u16) {
@@ -139,6 +142,20 @@ impl Frame {
             Frame::Detach => 10,
             Frame::Kicked => 11,
             Frame::Shutdown => 12,
+            Frame::Control { req, args } => {
+                put32(&mut p, *req);
+                put32(&mut p, args.len() as u32);
+                for a in args {
+                    put_bytes(&mut p, a.as_bytes());
+                }
+                13
+            }
+            Frame::ControlReply { req, ok, text } => {
+                put32(&mut p, *req);
+                put32(&mut p, *ok as u32);
+                put_bytes(&mut p, text.as_bytes());
+                14
+            }
         };
         let mut out = Vec::with_capacity(5 + p.len());
         out.push(tag);
@@ -188,6 +205,16 @@ impl Frame {
             10 => Frame::Detach,
             11 => Frame::Kicked,
             12 => Frame::Shutdown,
+            13 => {
+                let req = d.u32()?;
+                let n = d.u32()? as usize;
+                let mut args = Vec::with_capacity(n.min(256));
+                for _ in 0..n {
+                    args.push(d.string()?);
+                }
+                Frame::Control { req, args }
+            }
+            14 => Frame::ControlReply { req: d.u32()?, ok: d.u32()? != 0, text: d.string()? },
             t => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown frame type {t}"))),
         })
     }
@@ -380,15 +407,17 @@ pub use server::{kill_main, list_main, proxy_main, server_main};
 #[cfg(unix)]
 mod server {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    use crate::control::{self, Endpoint, Reply, Request};
+    use crate::layout::{self, Dir, Node, Tab};
     use crate::pty::{self, Pty, PtyMsg};
     use crate::term::Term;
 
@@ -540,12 +569,181 @@ mod server {
         Frame(u64, Frame),
         Gone(u64),
         Pty(u32, PtyMsg),
+        Control(Request, mpsc::Sender<Reply>),
     }
 
     struct Pane {
         term: Term,
         parser: vte::Parser,
         pty: Pty,
+        last_output: Instant,
+    }
+
+    type Client = Option<(u64, UnixStream)>;
+
+    fn send(client: &mut Client, f: &Frame) {
+        if let Some((_, s)) = client {
+            if f.write_to(s).is_err() {
+                *client = None;
+            }
+        }
+    }
+
+    /// The shells of a session, and the layout the window last reported.
+    struct Shells {
+        panes: HashMap<u32, Pane>,
+        layout: String,
+        tx: mpsc::Sender<Msg>,
+        control: Option<Endpoint>,
+    }
+
+    impl Shells {
+        fn spawn(&mut self, id: u32, cols: usize, rows: usize, cell: (usize, usize), command: &[String]) -> Result<(), String> {
+            let (cols, rows) = (cols.max(2), rows.max(1));
+            let mut term = Term::new(cols, rows, 10_000);
+            term.cell_px = cell;
+            let tx = self.tx.clone();
+            let env = self.control.as_ref().map(|c| c.env(id as usize)).unwrap_or_default();
+            let pty = pty::spawn(command, cols, rows, cell, &env, move |m| {
+                let _ = tx.send(Msg::Pty(id, m));
+            })?;
+            self.panes.insert(id, Pane { term, parser: vte::Parser::new(), pty, last_output: Instant::now() });
+            Ok(())
+        }
+
+        fn pane(&mut self, id: usize) -> Result<&mut Pane, String> {
+            u32::try_from(id).ok().and_then(|i| self.panes.get_mut(&i)).ok_or_else(|| control::no_pane(id))
+        }
+
+        /// The saved tabs, without panes that have exited.
+        fn tabs(&self) -> (Vec<Tab>, usize) {
+            let (saved, active) = layout::decode_tabs(&self.layout);
+            let tabs: Vec<Tab> = saved
+                .into_iter()
+                .filter_map(|t| {
+                    let tree = t.tree.retain(&|id| self.panes.contains_key(&(id as u32)))?;
+                    let focus = if tree.contains(t.focus) { t.focus } else { tree.first_leaf() };
+                    Some(Tab { tree, focus, zoomed: t.zoomed })
+                })
+                .collect();
+            let active = active.min(tabs.len().saturating_sub(1));
+            (tabs, active)
+        }
+
+        /// Answer a `lterm pane` request here. Requests that change the layout come here
+        /// only while no window is attached; then the server edits the saved layout, and
+        /// the next window shows the result.
+        fn request(&mut self, req: Request, client: &mut Client) -> Reply {
+            match req {
+                Request::List => {
+                    let (tabs, active) = self.tabs();
+                    let mut out = String::new();
+                    let mut listed = HashSet::new();
+                    for (ti, tab) in tabs.iter().enumerate() {
+                        for id in tab.tree.leaves() {
+                            listed.insert(id as u32);
+                            let focused = ti == active && id == tab.focus;
+                            out.push_str(&control::list_line(id, Some(ti), &self.panes[&(id as u32)].term, focused));
+                        }
+                    }
+                    let mut rest: Vec<u32> = self.panes.keys().copied().filter(|id| !listed.contains(id)).collect();
+                    rest.sort();
+                    for id in rest {
+                        out.push_str(&control::list_line(id as usize, None, &self.panes[&id].term, false));
+                    }
+                    Ok(out)
+                }
+                Request::Send { id, paste, data } => {
+                    let p = self.pane(id)?;
+                    let bytes = control::input_bytes(&p.term, paste, &data);
+                    p.pty.write(&bytes);
+                    Ok(String::new())
+                }
+                Request::Read { id, lines } => Ok(control::read_text(&self.pane(id)?.term, lines)),
+                Request::Info { id } => {
+                    let p = self.pane(id)?;
+                    Ok(control::info_text(&p.term, p.last_output))
+                }
+                Request::Close { id } => {
+                    self.pane(id)?;
+                    self.panes.remove(&(id as u32));
+                    send(client, &Frame::Exited { id: id as u32 });
+                    Ok(String::new())
+                }
+                Request::Focus { id } => {
+                    self.pane(id)?;
+                    let (mut tabs, active) = self.tabs();
+                    if let Some(ti) = tabs.iter().position(|t| t.tree.contains(id)) {
+                        tabs[ti].focus = id;
+                        self.layout = layout::encode_tabs(&tabs, ti);
+                    } else {
+                        self.layout = layout::encode_tabs(&tabs, active);
+                    }
+                    Ok(String::new())
+                }
+                Request::Split { target, dir, focus, run, command } => {
+                    let (mut tabs, mut active) = self.tabs();
+                    let target = match target {
+                        Some(t) => t,
+                        None => tabs.get(active).map(|t| t.focus).ok_or("the session has no panes")?,
+                    };
+                    let t = &self.pane(target)?.term;
+                    let (cols, rows) = match dir {
+                        Dir::Right => (t.cols / 2, t.rows),
+                        Dir::Down => (t.cols, t.rows / 2),
+                    };
+                    let cell = t.cell_px;
+                    let id = self.next_id();
+                    self.spawn(id, cols, rows, cell, &command)?;
+                    let new = id as usize;
+                    let ti = match tabs.iter().position(|t| t.tree.contains(target)) {
+                        Some(ti) => {
+                            tabs[ti].tree.split(target, dir, new);
+                            tabs[ti].zoomed = false;
+                            ti
+                        }
+                        None => {
+                            tabs.push(Tab { tree: Node::Leaf(new), focus: new, zoomed: false });
+                            tabs.len() - 1
+                        }
+                    };
+                    if focus {
+                        tabs[ti].focus = new;
+                        active = ti;
+                    }
+                    self.layout = layout::encode_tabs(&tabs, active);
+                    self.started(id, &run)
+                }
+                Request::Tab { focus, run, command } => {
+                    let (mut tabs, active) = self.tabs();
+                    let size = self.panes.values().next().map(|p| (p.term.cols, p.term.rows, p.term.cell_px));
+                    let (cols, rows, cell) = size.unwrap_or((80, 24, (8, 16)));
+                    let id = self.next_id();
+                    self.spawn(id, cols, rows, cell, &command)?;
+                    tabs.push(Tab { tree: Node::Leaf(id as usize), focus: id as usize, zoomed: false });
+                    let active = if focus { tabs.len() - 1 } else { active };
+                    self.layout = layout::encode_tabs(&tabs, active);
+                    self.started(id, &run)
+                }
+            }
+        }
+
+        fn next_id(&self) -> u32 {
+            self.panes.keys().max().map_or(0, |m| m + 1)
+        }
+
+        fn started(&mut self, id: u32, run: &str) -> Reply {
+            if let (false, Some(p)) = (run.is_empty(), self.panes.get_mut(&id)) {
+                p.pty.write(format!("{run}\r").as_bytes());
+            }
+            Ok(format!("{id}\n"))
+        }
+    }
+
+    fn fail_waiting(waiting: &mut HashMap<u32, mpsc::Sender<Reply>>) {
+        for (_, reply) in waiting.drain() {
+            let _ = reply.send(Err("the window detached; try again".into()));
+        }
     }
 
     /// `lterm session-server NAME`: own the shells of one session.
@@ -577,22 +775,27 @@ mod server {
             }
         });
 
-        let mut panes: HashMap<u32, Pane> = HashMap::new();
-        let mut layout = String::new();
+        // `lterm pane` requests from programs in the panes, on a socket next to the session's.
+        let ctl_path = path.with_extension("ctl");
+        let _ = std::fs::remove_file(&ctl_path);
+        let control = UnixListener::bind(&ctl_path).ok().map(|l| {
+            let _ = std::fs::set_permissions(&ctl_path, std::fs::Permissions::from_mode(0o600));
+            let tx = tx.clone();
+            control::serve_unix(l, ctl_path.to_string_lossy().into_owned(), move |req, reply| {
+                let _ = tx.send(Msg::Control(req, reply));
+            })
+        });
+
+        let mut sh = Shells { panes: HashMap::new(), layout: String::new(), tx: tx.clone(), control };
         // The attached window: (connection id, stream).
-        let mut client: Option<(u64, UnixStream)> = None;
+        let mut client: Client = None;
         // Connections that haven't said Hello yet (`lterm kill` connections never do).
         let mut pending: HashMap<u64, UnixStream> = HashMap::new();
         let mut next_conn = 0u64;
         let mut started = false;
-
-        let send = |client: &mut Option<(u64, UnixStream)>, f: &Frame| {
-            if let Some((_, s)) = client {
-                if f.write_to(s).is_err() {
-                    *client = None;
-                }
-            }
-        };
+        // Control requests passed to the window, by request number.
+        let mut waiting: HashMap<u32, mpsc::Sender<Reply>> = HashMap::new();
+        let mut next_req = 0u32;
 
         while let Ok(msg) = rx.recv() {
             match msg {
@@ -618,19 +821,20 @@ mod server {
                         let _ = Frame::Kicked.write_to(&mut old);
                         let _ = old.shutdown(std::net::Shutdown::Both);
                     }
+                    fail_waiting(&mut waiting);
                     client = Some((conn, stream));
-                    let mut ids: Vec<u32> = panes.keys().copied().collect();
+                    let mut ids: Vec<u32> = sh.panes.keys().copied().collect();
                     ids.sort();
                     let info = ids
                         .iter()
                         .map(|id| {
-                            let t = &panes[id].term;
+                            let t = &sh.panes[id].term;
                             PaneInfo { id: *id, cols: t.cols as u16, rows: t.rows as u16 }
                         })
                         .collect();
-                    send(&mut client, &Frame::Welcome { version: VERSION, layout: layout.clone(), panes: info });
+                    send(&mut client, &Frame::Welcome { version: VERSION, layout: sh.layout.clone(), panes: info });
                     for id in ids {
-                        let data = panes[&id].term.snapshot(5000);
+                        let data = sh.panes[&id].term.snapshot(5000);
                         send(&mut client, &Frame::Output { id, data });
                     }
                 }
@@ -641,21 +845,12 @@ mod server {
                     }
                     match f {
                         Frame::Spawn { id, cols, rows, cw, ch, command } => {
-                            if panes.contains_key(&id) {
+                            if sh.panes.contains_key(&id) {
                                 continue;
                             }
-                            let (cols, rows) = (cols.max(2) as usize, rows.max(1) as usize);
                             let cell = (cw.max(1) as usize, ch.max(1) as usize);
-                            let mut term = Term::new(cols, rows, 10_000);
-                            term.cell_px = cell;
-                            let tx = tx.clone();
-                            match pty::spawn(&command, cols, rows, cell, move |m| {
-                                let _ = tx.send(Msg::Pty(id, m));
-                            }) {
-                                Ok(pty) => {
-                                    panes.insert(id, Pane { term, parser: vte::Parser::new(), pty });
-                                    started = true;
-                                }
+                            match sh.spawn(id, cols as usize, rows as usize, cell, &command) {
+                                Ok(()) => started = true,
                                 Err(e) => {
                                     let data = format!("lterm: cannot start shell: {e}\r\n").into_bytes();
                                     send(&mut client, &Frame::Output { id, data });
@@ -664,12 +859,12 @@ mod server {
                             }
                         }
                         Frame::Input { id, data } => {
-                            if let Some(p) = panes.get_mut(&id) {
+                            if let Some(p) = sh.panes.get_mut(&id) {
                                 p.pty.write(&data);
                             }
                         }
                         Frame::Resize { id, cols, rows, cw, ch } => {
-                            if let Some(p) = panes.get_mut(&id) {
+                            if let Some(p) = sh.panes.get_mut(&id) {
                                 let cell = (cw.max(1) as usize, ch.max(1) as usize);
                                 p.term.cell_px = cell;
                                 p.term.resize(cols.max(2) as usize, rows.max(1) as usize);
@@ -677,13 +872,19 @@ mod server {
                             }
                         }
                         Frame::Kill { id } => {
-                            panes.remove(&id);
+                            sh.panes.remove(&id);
                         }
-                        Frame::Layout { data } => layout = data,
+                        Frame::Layout { data } => sh.layout = data,
+                        Frame::ControlReply { req, ok, text } => {
+                            if let Some(reply) = waiting.remove(&req) {
+                                let _ = reply.send(if ok { Ok(text) } else { Err(text) });
+                            }
+                        }
                         Frame::Detach => {
                             if let Some((_, s)) = client.take() {
                                 let _ = s.shutdown(std::net::Shutdown::Both);
                             }
+                            fail_waiting(&mut waiting);
                         }
                         _ => {}
                     }
@@ -692,28 +893,47 @@ mod server {
                     pending.remove(&conn);
                     if client.as_ref().map(|(c, _)| *c) == Some(conn) {
                         client = None;
+                        fail_waiting(&mut waiting);
+                    }
+                }
+                Msg::Control(req, reply) => {
+                    // The window owns the layout while it's attached, so it makes those changes.
+                    let layout_change = matches!(req, Request::Split { .. } | Request::Tab { .. } | Request::Focus { .. });
+                    if layout_change && client.is_some() {
+                        let n = next_req;
+                        next_req = next_req.wrapping_add(1);
+                        send(&mut client, &Frame::Control { req: n, args: req.encode() });
+                        if client.is_some() {
+                            waiting.insert(n, reply);
+                        } else {
+                            let _ = reply.send(Err("the window went away; try again".into()));
+                        }
+                    } else {
+                        let _ = reply.send(sh.request(req, &mut client));
                     }
                 }
                 Msg::Pty(id, PtyMsg::Data(data)) => {
-                    let Some(p) = panes.get_mut(&id) else { continue };
+                    let Some(p) = sh.panes.get_mut(&id) else { continue };
                     // The server answers terminal queries; it's there even while detached.
                     p.term.feed(&mut p.parser, &data);
+                    p.last_output = Instant::now();
                     let replies = std::mem::take(&mut p.term.responses);
                     p.pty.write(&replies);
                     send(&mut client, &Frame::Output { id, data });
                 }
                 Msg::Pty(id, PtyMsg::Exit) => {
-                    if panes.remove(&id).is_some() {
+                    if sh.panes.remove(&id).is_some() {
                         send(&mut client, &Frame::Exited { id });
                     }
                 }
             }
-            if started && panes.is_empty() {
+            if started && sh.panes.is_empty() {
                 break; // the last shell exited: the session is over
             }
         }
-        drop(panes);
+        drop(sh);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&ctl_path);
         ExitCode::SUCCESS
     }
 }
@@ -737,6 +957,8 @@ mod tests {
             Frame::Detach,
             Frame::Kicked,
             Frame::Shutdown,
+            Frame::Control { req: 5, args: vec!["split".into(), String::new(), "down".into()] },
+            Frame::ControlReply { req: 5, ok: true, text: "8\n".into() },
         ];
         let mut buf = b"Welcome to Ubuntu!\n".to_vec();
         buf.extend_from_slice(MAGIC);

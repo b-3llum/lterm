@@ -3,6 +3,7 @@
 
 mod app;
 mod askpass;
+mod control;
 mod copymode;
 mod graphics;
 mod input;
@@ -39,6 +40,8 @@ USAGE:
     lterm --attach TARGET [--session NAME]   Open a window attached to a persistent session
     lterm md [OPTIONS] [FILE]...             Render Markdown or images here (lterm md --help)
     lterm keys                               Print the keyboard shortcuts
+    lterm pane COMMAND                       From inside lterm: split, type into, read and
+                                             wait for panes (lterm pane --help)
     lterm push HOST                          Install lterm on a server over your SSH login
     lterm install                            Install for this user (PATH, app menu / Start menu)
     lterm uninstall                          Undo `lterm install`
@@ -297,6 +300,7 @@ fn main() -> ExitCode {
             print_keys(&std::env::var("LTERM_LEADER").unwrap_or_else(|_| "ctrl+space".into()));
             return ExitCode::SUCCESS;
         }
+        Some("pane") => return control::main(&args[1..]),
         Some("push") => return push::main(&args[1..]),
         Some("install") => return install::main(false),
         Some("uninstall") => return install::main(true),
@@ -387,7 +391,7 @@ fn snapshot(opts: &Options, path: &Path) -> Result<(), String> {
         let mut term = Term::new(cols, rows, opts.scrollback);
         term.cell_px = renderer.cell();
         let tx = tx.clone();
-        let pty = pty::spawn(&opts.command, cols, rows, renderer.cell(), move |m| {
+        let pty = pty::spawn(&opts.command, cols, rows, renderer.cell(), &[], move |m| {
             let _ = tx.send((id, m));
         })?;
         terms.insert(id, term);

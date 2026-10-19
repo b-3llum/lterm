@@ -40,13 +40,15 @@ fn default_command() -> CommandBuilder {
     CommandBuilder::new_default_prog()
 }
 
-/// Start `command` (or the user's shell) and stream its output to `sink` from a
-/// background thread. `sink` gets `PtyMsg::Exit` once the child has exited.
+/// Start `command` (or the user's shell) with extra environment `env`, and stream its
+/// output to `sink` from a background thread. `sink` gets `PtyMsg::Exit` once the child
+/// has exited.
 pub fn spawn(
     command: &[String],
     cols: usize,
     rows: usize,
     cell_px: (usize, usize),
+    env: &[(String, String)],
     sink: impl Fn(PtyMsg) + Send + Clone + 'static,
 ) -> Result<Pty, String> {
     let pair = native_pty_system().openpty(size(cols, rows, cell_px)).map_err(|e| e.to_string())?;
@@ -65,6 +67,9 @@ pub fn spawn(
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "lterm");
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     // Let `wsl.exe` forward these into Linux.
     let wslenv = std::env::var("WSLENV").unwrap_or_default();
     let sep = if wslenv.is_empty() { "" } else { ":" };

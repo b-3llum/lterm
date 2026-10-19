@@ -325,6 +325,11 @@ impl Term {
         }
     }
 
+    /// The title the program set last (OSC 0/2).
+    pub fn current_title(&self) -> &str {
+        &self.current_title
+    }
+
     pub fn cursor_pos(&self) -> (usize, usize) {
         (self.cursor.x, self.cursor.y)
     }

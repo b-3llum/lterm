@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem::take;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
@@ -14,6 +15,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Icon, UserAttentionType, Window, WindowId};
 
+use crate::control::{self, Endpoint, Reply, Request};
 use crate::copymode::{CopyMode, Outcome};
 use crate::keymap::{self, Cmd, Leader};
 use crate::layout::{self, Dir, Node, Rect, Tab};
@@ -27,6 +29,8 @@ pub enum AppEvent {
     Pty(usize, PtyMsg),
     /// From session connection number `.0`; events of older connections are ignored.
     Conn(u64, ConnEvent),
+    /// A `lterm pane ...` request, and where its answer goes.
+    Control(Request, mpsc::Sender<Reply>),
 }
 
 struct Gui {
@@ -46,6 +50,7 @@ struct Pane {
     selection: Option<Selection>,
     title: String,
     copy: Option<CopyMode>,
+    last_output: Instant,
 }
 
 enum LeaderState {
@@ -78,6 +83,9 @@ pub struct App {
     bar: Option<Rect>,
     tab_labels: Vec<TabLabel>,
     backend: Backend,
+    /// Where `lterm pane` reaches this window (local panes only; a session server
+    /// serves its own panes).
+    control: Option<Endpoint>,
     leader: Leader,
     leader_state: LeaderState,
     help: bool,
@@ -103,6 +111,16 @@ impl App {
             Some(t) => Backend::Remote { target: Target::parse(t), conn: None, attached: false, generation: 0 },
             None => Backend::Local,
         };
+        let control = match backend {
+            Backend::Local => {
+                let p = proxy.clone();
+                control::serve_tcp(move |req, reply| {
+                    let _ = p.send_event(AppEvent::Control(req, reply));
+                })
+                .ok()
+            }
+            Backend::Remote { .. } => None,
+        };
         App {
             font_size: opts.font_size,
             opts,
@@ -118,6 +136,7 @@ impl App {
             bar: None,
             tab_labels: Vec::new(),
             backend,
+            control,
             leader,
             leader_state: LeaderState::Idle,
             help: false,
@@ -171,6 +190,9 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             AppEvent::Pty(id, PtyMsg::Data(data)) => self.output(id, &data),
             AppEvent::Pty(id, PtyMsg::Exit) => self.close_pane(id, el, false),
+            AppEvent::Control(req, reply) => {
+                let _ = reply.send(self.control(req, el));
+            }
             AppEvent::Conn(generation, ev) => {
                 if matches!(self.backend, Backend::Remote { generation: g, .. } if g == generation) {
                     self.on_conn(ev, el);
@@ -229,7 +251,8 @@ impl App {
         self.tabs.get(self.active).map_or(usize::MAX, |t| t.focus)
     }
 
-    fn new_pane(&mut self, cols: usize, rows: usize) -> usize {
+    /// A new pane running `command` (empty: the default command, or the shell).
+    fn new_pane(&mut self, cols: usize, rows: usize, command: &[String]) -> usize {
         let id = self.next_id;
         self.next_id += 1;
         let renderer = self.renderer.as_ref().expect("renderer exists before panes");
@@ -238,15 +261,17 @@ impl App {
         term.cell_px = cell;
         term.default_colors = (render::rgb_bytes(renderer.theme.fg), render::rgb_bytes(renderer.theme.bg));
         let mut parser = vte::Parser::new();
+        let command = if command.is_empty() { self.opts.command.clone() } else { command.to_vec() };
         let pty = match &mut self.backend {
             Backend::Local => {
                 let proxy = self.proxy.clone();
-                match pty::spawn(&self.opts.command, cols, rows, cell, move |m| {
+                let env = self.control.as_ref().map(|c| c.env(id)).unwrap_or_default();
+                match pty::spawn(&command, cols, rows, cell, &env, move |m| {
                     let _ = proxy.send_event(AppEvent::Pty(id, m));
                 }) {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        let what = self.opts.command.first().map_or("shell", |s| s.as_str());
+                        let what = command.first().map_or("shell", |s| s.as_str());
                         let msg = format!("\x1b[31mlterm: cannot start {what}: {e}\x1b[0m\r\n");
                         term.feed(&mut parser, msg.as_bytes());
                         None
@@ -261,14 +286,23 @@ impl App {
                         rows: rows as u16,
                         cw: cell.0 as u16,
                         ch: cell.1 as u16,
-                        command: self.opts.command.clone(),
+                        command,
                     });
                 }
                 None
             }
         };
         let remote = self.remote();
-        let pane = Pane { term, parser, pty, remote, selection: None, title: String::new(), copy: None };
+        let pane = Pane {
+            term,
+            parser,
+            pty,
+            remote,
+            selection: None,
+            title: String::new(),
+            copy: None,
+            last_output: Instant::now(),
+        };
         self.panes.insert(id, pane);
         id
     }
@@ -282,15 +316,25 @@ impl App {
     }
 
     fn new_tab(&mut self) {
-        let Some(r) = &self.renderer else { return };
+        self.add_tab(&[], true);
+    }
+
+    /// Open a tab running `command`, switching to it if `activate`. Returns its pane.
+    fn add_tab(&mut self, command: &[String], activate: bool) -> Option<usize> {
+        let r = self.renderer.as_ref()?;
         let area = self.pane_area();
         let (cols, rows) = r.grid_size(area.w, area.h);
-        let id = self.new_pane(cols, rows);
-        self.focus_event(self.focus(), false);
+        let id = self.new_pane(cols, rows, command);
+        if activate {
+            self.focus_event(self.focus(), false);
+        }
         self.tabs.push(Tab { tree: Node::Leaf(id), focus: id, zoomed: false });
-        self.active = self.tabs.len() - 1;
+        if activate || self.tabs.len() == 1 {
+            self.active = self.tabs.len() - 1;
+        }
         self.relayout();
         self.update_title();
+        Some(id)
     }
 
     fn switch_tab(&mut self, i: usize) {
@@ -314,18 +358,36 @@ impl App {
     }
 
     fn split(&mut self, dir: Dir) {
-        let focus = self.focus();
-        let rect = self.rects.iter().find(|(id, _)| *id == focus).map(|(_, r)| *r);
-        let (Some(rect), Some(r)) = (rect, &self.renderer) else { return };
-        let (_, half, _) = layout::split_rect(rect, dir, 0.5, self.gap());
-        let (cols, rows) = r.grid_size(half.w, half.h);
-        let id = self.new_pane(cols, rows);
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.tree.split(focus, dir, id);
-            tab.zoomed = false;
+        if let Some(id) = self.split_pane(self.focus(), dir, &[]) {
+            self.set_focus(id);
         }
-        self.set_focus(id);
+    }
+
+    /// Split pane `target` (in any tab) and start `command` in the new pane, without
+    /// moving the focus. Returns the new pane.
+    fn split_pane(&mut self, target: usize, dir: Dir, command: &[String]) -> Option<usize> {
+        let ti = self.tabs.iter().position(|t| t.tree.contains(target))?;
+        let r = self.renderer.as_ref()?;
+        let (cols, rows) = match self.rect_of(target).filter(|_| ti == self.active) {
+            Some(rect) => {
+                let (_, half, _) = layout::split_rect(rect, dir, 0.5, self.gap());
+                r.grid_size(half.w, half.h)
+            }
+            // Not on screen: a guess, corrected when its tab is shown.
+            None => {
+                let t = &self.panes.get(&target)?.term;
+                match dir {
+                    Dir::Right => (t.cols / 2, t.rows),
+                    Dir::Down => (t.cols, t.rows / 2),
+                }
+            }
+        };
+        let id = self.new_pane(cols, rows, command);
+        let tab = &mut self.tabs[ti];
+        tab.tree.split(target, dir, id);
+        tab.zoomed = false;
         self.relayout();
+        Some(id)
     }
 
     /// Remove a pane. With `notify`, a session server is told to end it too (not needed
@@ -428,6 +490,7 @@ impl App {
     fn output(&mut self, id: usize, data: &[u8]) {
         let Some(p) = self.panes.get_mut(&id) else { return };
         p.term.feed(&mut p.parser, data);
+        p.last_output = Instant::now();
         let replies = take(&mut p.term.responses);
         // In a session the server answers terminal queries, so drop ours.
         if !p.remote {
@@ -1020,6 +1083,85 @@ impl App {
     }
 }
 
+// ---------------------------------------------------------------- control API (lterm pane)
+
+impl App {
+    /// Answer a `lterm pane ...` request (from this window's panes, or forwarded by the
+    /// session server for requests that change the layout).
+    fn control(&mut self, req: Request, el: &ActiveEventLoop) -> Reply {
+        let exists = |app: &App, id: usize| if app.panes.contains_key(&id) { Ok(()) } else { Err(control::no_pane(id)) };
+        let reply = match req {
+            Request::List => {
+                let mut out = String::new();
+                for (ti, tab) in self.tabs.iter().enumerate() {
+                    for id in tab.tree.leaves() {
+                        if let Some(p) = self.panes.get(&id) {
+                            let focused = ti == self.active && id == tab.focus;
+                            out.push_str(&control::list_line(id, Some(ti), &p.term, focused));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Request::Split { target, dir, focus, run, command } => {
+                let target = target.unwrap_or(self.focus());
+                exists(self, target)?;
+                let id = self.split_pane(target, dir, &command).ok_or(control::no_pane(target))?;
+                self.started(id, focus, &run)
+            }
+            Request::Tab { focus, run, command } => {
+                let id = self.add_tab(&command, focus).ok_or("no window yet")?;
+                self.started(id, focus, &run)
+            }
+            Request::Send { id, paste, data } => {
+                let p = self.panes.get(&id).ok_or(control::no_pane(id))?;
+                let bytes = control::input_bytes(&p.term, paste, &data);
+                self.write_pane(id, &bytes);
+                Ok(String::new())
+            }
+            Request::Read { id, lines } => {
+                let p = self.panes.get(&id).ok_or(control::no_pane(id))?;
+                Ok(control::read_text(&p.term, lines))
+            }
+            Request::Info { id } => {
+                let p = self.panes.get(&id).ok_or(control::no_pane(id))?;
+                Ok(control::info_text(&p.term, p.last_output))
+            }
+            Request::Focus { id } => {
+                exists(self, id)?;
+                self.focus_pane(id);
+                Ok(String::new())
+            }
+            Request::Close { id } => {
+                exists(self, id)?;
+                self.close_pane(id, el, true);
+                Ok(String::new())
+            }
+        };
+        self.request_redraw();
+        reply
+    }
+
+    /// After a control request opened pane `id`: focus it if asked and type `run` into it.
+    fn started(&mut self, id: usize, focus: bool, run: &str) -> Reply {
+        if focus {
+            self.focus_pane(id);
+        }
+        if !run.is_empty() {
+            self.write_pane(id, format!("{run}\r").as_bytes());
+        }
+        Ok(format!("{id}\n"))
+    }
+
+    /// Focus pane `id`, switching to its tab.
+    fn focus_pane(&mut self, id: usize) {
+        if let Some(ti) = self.tabs.iter().position(|t| t.tree.contains(id)) {
+            self.switch_tab(ti);
+            self.set_focus(id);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- sessions
 
 impl App {
@@ -1049,6 +1191,16 @@ impl App {
             ConnEvent::Frame(Frame::Output { id, data }) => self.output(id as usize, &data),
             ConnEvent::Frame(Frame::Exited { id }) => self.close_pane(id as usize, el, false),
             ConnEvent::Frame(Frame::Kicked) => self.disconnected("Detached: the session was opened in another window."),
+            ConnEvent::Frame(Frame::Control { req, args }) => {
+                let reply = Request::decode(&args).and_then(|r| self.control(r, el));
+                if let Backend::Remote { conn: Some(c), .. } = &mut self.backend {
+                    let (ok, text) = match reply {
+                        Ok(t) => (true, t),
+                        Err(e) => (false, e),
+                    };
+                    c.send(&Frame::ControlReply { req, ok, text });
+                }
+            }
             ConnEvent::Frame(_) => {}
             ConnEvent::Closed(msg) => self.disconnected(&msg),
         }
@@ -1101,6 +1253,7 @@ impl App {
                 selection: None,
                 title: String::new(),
                 copy: None,
+                last_output: Instant::now(),
             };
             self.panes.insert(info.id as usize, pane);
         }

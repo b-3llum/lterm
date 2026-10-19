@@ -52,6 +52,24 @@ lterm --attach user@server     # 2. connect. Split and add tabs freely, with no 
 - **Several sessions:** add `-s NAME` (for example `-s logs`). On the server, `lterm ls` lists them and `lterm kill NAME` ends one.
 - **On Windows,** `lterm --attach wsl` does the same with shells inside WSL.
 
+### Let agents and scripts drive panes
+
+Programs running inside lterm (coding agents such as Claude Code or Codex, scripts) can open
+panes, type into them, read them and wait for them with `lterm pane`:
+
+```
+id=$(lterm pane split --run "claude 'fix the failing auth tests'")   # new pane, prints its id
+lterm pane wait $id --idle 5          # until it has printed nothing for 5 s
+lterm pane read $id --lines 40        # its last 40 lines of text
+lterm pane send $id "also run the linter"     # type a line and press Enter
+lterm pane keys $id esc               # or press keys: enter, up, ctrl-c, ...
+lterm pane list                       # every pane: id, tab, size, focus, title
+lterm pane close $id
+```
+
+It works in plain windows and in sessions (`--attach`), including while no window is attached.
+`lterm pane --help` lists every option.
+
 ## Shortcuts
 
 Press **Ctrl+Space**, let go, then press a key. **F1** shows every shortcut in the window.
