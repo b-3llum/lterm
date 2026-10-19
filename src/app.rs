@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
@@ -211,6 +211,12 @@ impl ApplicationHandler<AppEvent> for App {
         let window = Rc::new(el.create_window(attrs).unwrap_or_else(|e| fatal(&e.to_string())));
         self.scale = window.scale_factor() as f32;
         renderer.set_scale(self.font_size, self.scale);
+        // The size above used scale-1 cells, and cells don't scale exactly (e.g. 8px at 1x
+        // but 17px at 2x), so ask again to get the requested grid on Retina-type screens.
+        if self.scale != 1.0 {
+            let (w, h) = renderer.frame_size(self.opts.size.0, self.opts.size.1);
+            let _ = window.request_inner_size(PhysicalSize::new(w as u32, h as u32));
+        }
         let context = softbuffer::Context::new(window.clone()).unwrap_or_else(|e| fatal(&e.to_string()));
         let surface = softbuffer::Surface::new(&context, window.clone()).unwrap_or_else(|e| fatal(&e.to_string()));
         self.clipboard = arboard::Clipboard::new().ok();
@@ -291,6 +297,8 @@ impl App {
 
     /// A new pane running `command` (empty: the default command, or the shell).
     fn new_pane(&mut self, cols: usize, rows: usize, command: &[String]) -> usize {
+        // What Term::new clamps to, so the pty gets the same size.
+        let (cols, rows) = (cols.max(2), rows.max(1));
         let id = self.next_id;
         self.next_id += 1;
         let renderer = self.renderer.as_ref().expect("renderer exists before panes");
